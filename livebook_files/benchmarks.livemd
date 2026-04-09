@@ -1,0 +1,171 @@
+# Systematic Benchmarks — TCC 2
+
+## Setup
+
+```elixir
+Mix.install([
+  {:nx, github: "elixir-nx/nx", sparse: "nx", override: true},
+  {:pythonx, "~> 0.4.7"},
+  {:benchee, "~> 1.3"},
+  {:benchee_csv, "~> 1.0"}
+])
+
+Pythonx.uv_init("""
+[project]
+name = "project"
+version = "0.0.0"
+requires-python = "==3.13.*"
+dependencies = [
+  "numpy==2.2.2"
+]
+""")
+```
+
+## Module Definitions
+
+All bridge modules redefined here (each Livebook is independent).
+
+```elixir
+defmodule NxNumpyBridge do
+  def nx_dtype_to_numpy(%{type: {:f, 64}}),  do: "float64"
+  def nx_dtype_to_numpy(%{type: {:f, 32}}),  do: "float32"
+  def nx_dtype_to_numpy(%{type: {:f, 16}}),  do: "float16"
+  def nx_dtype_to_numpy(%{type: {:s, 64}}),  do: "int64"
+  def nx_dtype_to_numpy(%{type: {:s, 32}}),  do: "int32"
+  def nx_dtype_to_numpy(%{type: {:s, 16}}),  do: "int16"
+  def nx_dtype_to_numpy(%{type: {:s,  8}}),  do: "int8"
+  def nx_dtype_to_numpy(%{type: {:u, 64}}),  do: "uint64"
+  def nx_dtype_to_numpy(%{type: {:u, 32}}),  do: "uint32"
+  def nx_dtype_to_numpy(%{type: {:u, 16}}),  do: "uint16"
+  def nx_dtype_to_numpy(%{type: {:u,  8}}),  do: "uint8"
+  def nx_dtype_to_numpy(%{type: {:c, 64}}),  do: "complex64"
+  def nx_dtype_to_numpy(%{type: {:c, 128}}), do: "complex128"
+end
+```
+
+```elixir
+defmodule NxNumpyBridgePOC do
+  import Nx.Defn
+
+  def python_callback(tensor, _opts) do
+    dtype = NxNumpyBridge.nx_dtype_to_numpy(tensor)
+    data = Nx.to_binary(tensor)
+    shape = Nx.shape(tensor)
+
+    {py_result, _env} =
+      Pythonx.eval(
+        """
+        import numpy as np
+
+        def main(data, shape, dtype):
+          x = np.frombuffer(data, dtype=dtype).reshape(shape)
+          y = x * 10
+          return (y.tobytes(), y.shape)
+
+        main(data, shape, dtype)
+        """,
+        %{"data" => data, "shape" => shape, "dtype" => dtype}
+      )
+
+    {out_data, out_shape} = Pythonx.decode(py_result)
+    out_data |> Nx.from_binary(tensor.type) |> Nx.reshape(out_shape)
+  end
+
+  defn run(x) do
+    y = Nx.runtime_call(Nx.to_template(x), x, &python_callback/2)
+    {x, y}
+  end
+end
+```
+
+```elixir
+defmodule NxNumpyViewBased do
+  import Nx.Defn
+
+  # Uses ndarray.view(np.uint8) to reinterpret result bytes without allocating
+  # a new buffer inside NumPy, eliminating the tobytes() intermediate copy.
+  # Pythonx still copies at the boundary (Erlang binary encoding) — 2 total
+  # copies vs 3 for copy-based.
+  def python_callback_view(tensor, _opts) do
+    dtype = NxNumpyBridge.nx_dtype_to_numpy(tensor)
+    data = Nx.to_binary(tensor)
+    shape = Nx.shape(tensor)
+
+    {py_result, _env} =
+      Pythonx.eval(
+        """
+        import numpy as np
+
+        x = np.frombuffer(data, dtype=dtype).reshape(shape)
+        y = x * 10
+        result = bytes(y.view(np.uint8))
+        result
+        """,
+        %{"data" => data, "shape" => Tuple.to_list(shape), "dtype" => dtype}
+      )
+
+    out_data = Pythonx.decode(py_result)
+    out_data |> Nx.from_binary(tensor.type) |> Nx.reshape(shape)
+  end
+
+  defn run(x) do
+    y = Nx.runtime_call(Nx.to_template(x), x, &python_callback_view/2)
+    {x, y}
+  end
+end
+```
+
+```elixir
+defmodule NativeNx do
+  import Nx.Defn
+
+  defn run(x) do
+    y = Nx.multiply(x, 10)
+    {x, y}
+  end
+end
+```
+
+## Benchmark Suite
+
+Compares copy-based, view-based, and native Nx across multiple tensor sizes and
+types. Native Nx uses the BinaryBackend (pure Erlang) — it quantifies the
+overhead added by the Python bridge relative to the default backend.
+
+Results are saved to `livebook_files/results/`.
+
+```elixir
+defmodule BenchmarkRunner do
+  def run_copy(t),       do: NxNumpyBridgePOC.run(t)
+  def run_view_based(t), do: NxNumpyViewBased.run(t)
+  def run_native(t),     do: NativeNx.run(t)
+end
+```
+
+```elixir
+inputs = %{
+  "1K   f64"     => Nx.iota({1_000})         |> Nx.as_type({:f, 64}),
+  "100K f64"     => Nx.iota({100_000})        |> Nx.as_type({:f, 64}),
+  "1M   f64"     => Nx.iota({1_000_000})      |> Nx.as_type({:f, 64}),
+  "1M   f32"     => Nx.iota({1_000_000})      |> Nx.as_type({:f, 32}),
+  "1M   s32"     => Nx.iota({1_000_000})      |> Nx.as_type({:s, 32}),
+  "1Mx1K 2D f64" => Nx.iota({1_000, 1_000})  |> Nx.as_type({:f, 64}),
+}
+
+Benchee.run(
+  %{
+    "copy-based (tobytes)"      => fn t -> BenchmarkRunner.run_copy(t) end,
+    "view-based (ndarray.view)" => fn t -> BenchmarkRunner.run_view_based(t) end,
+    "native Nx"                 => fn t -> BenchmarkRunner.run_native(t) end,
+  },
+  inputs: inputs,
+  time: 5,
+  warmup: 2,
+  memory_time: 2,
+  print: [benchmarking: false, fast_warning: false],
+  formatters: [
+    Benchee.Formatters.Console,
+    {Benchee.Formatters.CSV, file: "livebook_files/results/benchmarks.csv"}
+  ]
+)
+```
