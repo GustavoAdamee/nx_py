@@ -4,7 +4,7 @@
 
 Os artefatos estao organizados em tres notebooks Livebook:
 - `poc.livemd` — Implementacoes do bridge (copy-based e view-based) com benchmarks
-- `type_coverage.livemd` — Matriz de validacao completa dos 20 tipos Nx
+- `type_coverage.livemd` — Matriz de validacao completa dos 16 tipos Nx
 - `benchmarks.livemd` — Benchmarks sistematicos incluindo baseline nativo Nx
 
 ## 2. Implementacoes do Bridge
@@ -36,11 +36,11 @@ Um modulo auxiliar mapeia tipos Nx para strings de dtype NumPy. Tres estrategias
 |------------|-------|
 | **NumPy nativo** | `{:f, 64}`, `{:f, 32}`, `{:f, 16}`, `{:s, 8}`-`{:s, 64}`, `{:u, 8}`-`{:u, 64}`, `{:c, 64}`, `{:c, 128}` |
 | **ml_dtypes** | `{:bf, 16}`, `{:f, 8}` (E5M2), `{:f8_e4m3fn, 8}` (E4M3FN) |
-| **Widening cast** | `{:s, 2}`, `{:s, 4}` -> `int8`; `{:u, 2}`, `{:u, 4}` -> `uint8` |
+| **Nao suportado** | `{:s, 2}`, `{:s, 4}`, `{:u, 2}`, `{:u, 4}` — o usuario deve converter para um tipo mais largo antes de chamar o bridge |
 
 ## 3. Resultados de Cobertura de Tipos
 
-Todos os 20 tipos numericos do Nx foram testados com ambas as implementacoes. O teste computa `x * 10` atraves do bridge Python e compara o resultado com `Nx.multiply(tensor, 10)` nativo.
+Todos os 16 tipos numericos do Nx suportados pelo NumPy foram testados com ambas as implementacoes. O teste computa `x * 10` atraves do bridge Python e compara o resultado com `Nx.multiply(tensor, 10)` nativo.
 
 ```
 Tipo              Estrategia    Copy-based          View-based
@@ -55,14 +55,10 @@ Tipo              Estrategia    Copy-based          View-based
 {:s, 32}          nativo        ok                  ok
 {:s, 16}          nativo        ok                  ok
 {:s, 8}           nativo        ok                  ok
-{:s, 4}           cast->s8      ok                  ok
-{:s, 2}           cast->s8      ok                  ok
 {:u, 64}          nativo        ok                  ok
 {:u, 32}          nativo        ok                  ok
 {:u, 16}          nativo        ok                  ok
 {:u, 8}           nativo        ok                  ok
-{:u, 4}           cast->u8      ok                  ok
-{:u, 2}           cast->u8      ok                  ok
 {:c, 64}          nativo        ok                  ok
 {:c, 128}         nativo        ok                  ok
 ```
@@ -75,7 +71,7 @@ Tipo              Estrategia    Copy-based          View-based
 **Observacoes sobre tipos especificos:**
 - `{:f, 16}` e `{:f8_e4m3fn, 8}`: aprovados com ressalvas. f16 possui ~3,3 digitos decimais de precisao (mantissa de 10 bits); f8_e4m3fn possui ~1,2 digitos (mantissa de 3 bits, valor finito maximo de 448).
 - `{:bf, 16}` e `{:f, 8}` (E5M2): a divergencia e esperada e documentada. Reduzir os dados de teste para forcar aprovacao produziria um falso positivo — a divergencia reflete diferencas genuinas no comportamento de arredondamento entre o BinaryBackend do Nx e o ml_dtypes do NumPy.
-- Tipos sub-byte (`{:s, 2}`, `{:s, 4}`, `{:u, 2}`, `{:u, 4}`): testados com identidade (`* 1`) para evitar overflow. O bridge amplia para int8/uint8 antes da chamada Python e reduz de volta ao tipo original.
+- Tipos sub-byte (`{:s, 2}`, `{:s, 4}`, `{:u, 2}`, `{:u, 4}`): nao suportados pelo bridge. O usuario deve converter para um tipo mais largo (e.g. `{:s, 8}`, `{:u, 8}`) antes de chamar o bridge.
 
 ### 3.1 Validacao multidimensional
 
@@ -112,7 +108,7 @@ A abordagem view-based supera a copy-based de forma consistente. A vantagem cres
 
 **Observacoes principais:**
 
-1. **Ponto de cruzamento (crossover):** o bridge e mais lento que o Nx nativo abaixo de ~5-8K elementos (o custo fixo de entrada no CPython domina). Acima desse limiar, o bridge completa mais rapido.
+1. **Ponto de cruzamento (crossover):** o bridge e mais lento que o Nx nativo abaixo de ~5-8K **elementos** (~40-64 KB para f64) — o custo fixo de entrada no CPython domina. Acima desse limiar, o bridge completa mais rapido.
 2. **Memoria:** as implementacoes do bridge utilizam ~4 KB de heap de processo independentemente do tamanho do tensor. O Nx nativo utiliza ate ~100 MB para tensores f64 de 1M elementos. Essa diferenca ocorre porque binarios Erlang refc (> 64 bytes) residem fora do heap do processo.
    *Obs: o Benchee mede apenas o heap do processo. Os dados do bridge ainda existem na memoria (no binary heap compartilhado), apenas nao sao contabilizados por essa metrica.*
 3. **Agnosticismo de shape:** tensores 1D e 2D com o mesmo numero total de elementos (1M f64 vs 1000x1000 f64) apresentam desempenho virtualmente identico — o bridge opera sobre a representacao binaria flat, independente do shape.
@@ -133,9 +129,9 @@ Ambas as abordagens (copy-based e view-based) compartilham uma limitacao fundame
 
 | Objetivo | Status | Artefato |
 |----------|--------|----------|
-| Cobertura de tipos (20 tipos Nx) | Completo | `type_coverage.livemd` |
+| Cobertura de tipos (16 tipos Nx) | Completo | `type_coverage.livemd` |
 | Integracao com pipeline Nx (`runtime_call`) | Completo | `poc.livemd` |
 | Analise de copias de memoria | Completo | `poc.livemd`, `zero_copy_nif_future_work.livemd` |
 | Benchmarks sistematicos | Completo | `benchmarks.livemd` |
 
-O bridge de interoperabilidade funciona corretamente para todos os 20 tipos numericos do Nx (com ressalvas de precisao documentadas para floats de baixa precisao). O overhead e dominado pelo custo fixo de entrada no CPython para tensores pequenos e pela serializacao do Pythonx para tensores grandes. Uma abordagem zero-copy via NIF demonstra que o gargalo de serializacao pode ser eliminado em principio.
+O bridge de interoperabilidade funciona corretamente para todos os 16 tipos numericos do Nx suportados pelo NumPy (com ressalvas de precisao documentadas para floats de baixa precisao). O overhead e dominado pelo custo fixo de entrada no CPython para tensores pequenos e pela serializacao do Pythonx para tensores grandes. Uma abordagem zero-copy via NIF demonstra que o gargalo de serializacao pode ser eliminado em principio.

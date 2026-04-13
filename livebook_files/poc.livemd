@@ -4,7 +4,7 @@
 
 ```elixir
 Mix.install([
-  {:nx, github: "elixir-nx/nx", sparse: "nx", override: true},
+  {:nx, github: "elixir-nx/nx", sparse: "nx", override: true, ref: "4c741d35"},
   {:pythonx, "~> 0.4.7"},
   {:benchee, "~> 1.3"}
 ])
@@ -209,17 +209,17 @@ defmodule BenchmarkRunner do
 end
 
 inputs = %{
-  "1K   f64" => Nx.iota({1_000})     |> Nx.as_type({:f, 64}),
-  "100K f64" => Nx.iota({100_000})   |> Nx.as_type({:f, 64}),
-  "1M   f64" => Nx.iota({1_000_000}) |> Nx.as_type({:f, 64}),
-  "1M   f32" => Nx.iota({1_000_000}) |> Nx.as_type({:f, 32}),
-  "1M   s32" => Nx.iota({1_000_000}) |> Nx.as_type({:s, 32}),
+  "1K   f64" => Nx.iota({1_000}, type: {:f, 64}),
+  "100K f64" => Nx.iota({100_000}, type: {:f, 64}),
+  "1M   f64" => Nx.iota({1_000_000}, type: {:f, 64}),
+  "1M   f32" => Nx.iota({1_000_000}, type: {:f, 32}),
+  "1M   s32" => Nx.iota({1_000_000}, type: {:s, 32}),
 }
 
 Benchee.run(
   %{
-    "copy-based (tobytes)"    => fn t -> BenchmarkRunner.run_copy(t) end,
-    "view-based (ndarray.view)" => fn t -> BenchmarkRunner.run_view_based(t) end,
+    "copy-based (tobytes)"      => &BenchmarkRunner.run_copy/1,
+    "view-based (ndarray.view)" => &BenchmarkRunner.run_view_based/1,
   },
   inputs: inputs,
   time: 5,

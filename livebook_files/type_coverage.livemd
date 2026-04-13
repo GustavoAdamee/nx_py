@@ -22,9 +22,8 @@ dependencies = [
 
 ## Type Mapper
 
-Extended from `poc.livemd` to cover all 20 Nx types: native NumPy (13 types), ml_dtypes
-(`{:bf, 16}`, `{:f, 8}`, `{:f8_e4m3fn, 8}`), and widening cast to int8/uint8 for
-sub-byte types (`{:s, 2}`, `{:s, 4}`, `{:u, 2}`, `{:u, 4}`).
+Extended from `poc.livemd` to cover all 16 Nx types supported by NumPy: native NumPy
+(13 types) and ml_dtypes (`{:bf, 16}`, `{:f, 8}`, `{:f8_e4m3fn, 8}`).
 
 ```elixir
 defmodule NxNumpyBridge do
@@ -41,17 +40,11 @@ defmodule NxNumpyBridge do
   def nx_dtype_to_numpy(%{type: {:s, 32}}),  do: "int32"
   def nx_dtype_to_numpy(%{type: {:s, 16}}),  do: "int16"
   def nx_dtype_to_numpy(%{type: {:s,  8}}),  do: "int8"
-  # Sub-byte signed — no NumPy native; caller must widen to {:s, 8} first
-  def nx_dtype_to_numpy(%{type: {:s, 2}}), do: raise("sub-byte: widen to {:s, 8} first")
-  def nx_dtype_to_numpy(%{type: {:s, 4}}), do: raise("sub-byte: widen to {:s, 8} first")
   # Unsigned integers — native NumPy
   def nx_dtype_to_numpy(%{type: {:u, 64}}),  do: "uint64"
   def nx_dtype_to_numpy(%{type: {:u, 32}}),  do: "uint32"
   def nx_dtype_to_numpy(%{type: {:u, 16}}),  do: "uint16"
   def nx_dtype_to_numpy(%{type: {:u,  8}}),  do: "uint8"
-  # Sub-byte unsigned — no NumPy native; caller must widen to {:u, 8} first
-  def nx_dtype_to_numpy(%{type: {:u, 2}}), do: raise("sub-byte: widen to {:u, 8} first")
-  def nx_dtype_to_numpy(%{type: {:u, 4}}), do: raise("sub-byte: widen to {:u, 8} first")
   # Complex — native NumPy
   def nx_dtype_to_numpy(%{type: {:c, 64}}),  do: "complex64"
   def nx_dtype_to_numpy(%{type: {:c, 128}}), do: "complex128"
@@ -69,7 +62,6 @@ defmodule NxNumpyBridgePOC do
   end
 
   def python_callback(tensor) do
-    {tensor, original_type} = maybe_widen(tensor)
     dtype = NxNumpyBridge.nx_dtype_to_numpy(tensor)
     data = Nx.to_binary(tensor)
     shape = Nx.shape(tensor)
@@ -95,15 +87,7 @@ defmodule NxNumpyBridgePOC do
     out_data
     |> Nx.from_binary(tensor.type)
     |> Nx.reshape(out_shape)
-    |> maybe_narrow(original_type)
   end
-
-  defp maybe_widen(%{type: {:s, n}} = t) when n < 8, do: {Nx.as_type(t, {:s, 8}), t.type}
-  defp maybe_widen(%{type: {:u, n}} = t) when n < 8, do: {Nx.as_type(t, {:u, 8}), t.type}
-  defp maybe_widen(t),                                do: {t, nil}
-
-  defp maybe_narrow(result, nil),        do: result
-  defp maybe_narrow(result, orig_type),  do: Nx.as_type(result, orig_type)
 end
 ```
 
@@ -118,7 +102,6 @@ defmodule NxNumpyViewBased do
   end
 
   def python_callback_view(tensor) do
-    {tensor, original_type} = maybe_widen(tensor)
     dtype = NxNumpyBridge.nx_dtype_to_numpy(tensor)
     data = Nx.to_binary(tensor)
     shape = Nx.shape(tensor)
@@ -142,15 +125,7 @@ defmodule NxNumpyViewBased do
     out_data
     |> Nx.from_binary(tensor.type)
     |> Nx.reshape(shape)
-    |> maybe_narrow(original_type)
   end
-
-  defp maybe_widen(%{type: {:s, n}} = t) when n < 8, do: {Nx.as_type(t, {:s, 8}), t.type}
-  defp maybe_widen(%{type: {:u, n}} = t) when n < 8, do: {Nx.as_type(t, {:u, 8}), t.type}
-  defp maybe_widen(t),                                do: {t, nil}
-
-  defp maybe_narrow(result, nil),        do: result
-  defp maybe_narrow(result, orig_type),  do: Nx.as_type(result, orig_type)
 end
 ```
 
@@ -160,17 +135,13 @@ end
 | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `native`    | Direct `np.frombuffer(data, dtype=dtype)` with a standard NumPy dtype string                                                                       |
 | `ml_dtypes` | Requires `import ml_dtypes`; dtype resolved via `getattr(ml_dtypes, dtype)`                                                                        |
-| `cast→s8` | Tensor widened to `int8` before Python call; result narrowed back; test uses `* 1` to avoid overflow                                               |
-| `cast→u8` | Tensor widened to `uint8` before Python call; result narrowed back; test uses `* 1` to avoid overflow                                              |
 | `✓`       | Round-trip correct                                                                                                                                 |
 | `~`         | Passes with precision caveat — low-precision type; small integer test data passes, general use (fractional values or large integers) may diverge |
 | `✗`       | Fails                                                                                                                                              |
 
 ## Type × Implementation Matrix
 
-Runs `x * 10` through each bridge. For sub-byte types, the expected value is computed
-by simulating the bridge's widening path (`widen → *10 → narrow`) so the comparison
-is valid even when narrowing wraps values.
+Runs `x * 10` through each bridge.
 Types `{:f, 16}`, `{:bf, 16}`, `{:f, 8}`, and `{:f8_e4m3fn, 8}` are marked `~` (precision caveat — not a failure).
 
 ```elixir
@@ -181,12 +152,8 @@ types_to_test = [
   {:bf, 16}, {:f, 8}, {:f8_e4m3fn, 8},
   # Signed integers — native NumPy
   {:s, 64}, {:s, 32}, {:s, 16}, {:s, 8},
-  # Sub-byte signed integers — widened to int8 (no NumPy native)
-  {:s, 4}, {:s, 2},
   # Unsigned integers — native NumPy
   {:u, 64}, {:u, 32}, {:u, 16}, {:u, 8},
-  # Sub-byte unsigned integers — widened to uint8 (no NumPy native)
-  {:u, 4}, {:u, 2},
   # Complex — native NumPy
   {:c, 64}, {:c, 128}
 ]
@@ -211,8 +178,6 @@ Enum.each(types_to_test, fn type ->
     {:bf, 16}          -> "ml_dtypes"
     {:f, 8}            -> "ml_dtypes"
     {:f8_e4m3fn, 8}    -> "ml_dtypes"
-    {:s, n} when n < 8 -> "cast→s8"
-    {:u, n} when n < 8 -> "cast→u8"
     _                   -> "native"
   end
 
@@ -220,8 +185,6 @@ Enum.each(types_to_test, fn type ->
   # not just errors inside the bridge call.
   result_cols =
     try do
-      # Sub-byte types: expected simulates the bridge's widening path (widen → *10 → narrow),
-      # so the comparison is valid even though values wrap on narrowing.
       # fp8/float types: expected is tensor * 10 (precision caveat types are always marked ~).
       {tensor, expected} = case type do
         {:f8_e4m3fn, 8} ->
@@ -230,18 +193,6 @@ Enum.each(types_to_test, fn type ->
         {:f, 8} ->
           t = Nx.iota({10}) |> Nx.as_type(type)
           {t, Nx.multiply(t, 10)}
-        {:s, 2} ->
-          t = Nx.tensor([-2, -1, 0, 1]) |> Nx.as_type(type)
-          {t, t |> Nx.as_type({:s, 8}) |> Nx.multiply(10) |> Nx.as_type(type)}
-        {:s, 4} ->
-          t = Nx.iota({8}) |> Nx.as_type(type)
-          {t, t |> Nx.as_type({:s, 8}) |> Nx.multiply(10) |> Nx.as_type(type)}
-        {:u, 2} ->
-          t = Nx.tensor([0, 1, 2, 3]) |> Nx.as_type(type)
-          {t, t |> Nx.as_type({:u, 8}) |> Nx.multiply(10) |> Nx.as_type(type)}
-        {:u, 4} ->
-          t = Nx.iota({8}) |> Nx.as_type(type)
-          {t, t |> Nx.as_type({:u, 8}) |> Nx.multiply(10) |> Nx.as_type(type)}
         _ ->
           t = Nx.iota({100}) |> Nx.as_type(type)
           {t, Nx.multiply(t, 10)}
