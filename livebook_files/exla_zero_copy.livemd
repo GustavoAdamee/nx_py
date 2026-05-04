@@ -62,24 +62,6 @@ defmodule NxNumpyBridge do
   # Complex — native NumPy
   def nx_dtype_to_numpy(%{type: {:c, 64}}),  do: "complex64"
   def nx_dtype_to_numpy(%{type: {:c, 128}}), do: "complex128"
-
-  # NumPy dtype string to byte size per element
-  def numpy_dtype_size("float64"),     do: 8
-  def numpy_dtype_size("float32"),     do: 4
-  def numpy_dtype_size("float16"),     do: 2
-  def numpy_dtype_size("bfloat16"),    do: 2
-  def numpy_dtype_size("float8_e5m2"), do: 1
-  def numpy_dtype_size("float8_e4m3fn"), do: 1
-  def numpy_dtype_size("int64"),       do: 8
-  def numpy_dtype_size("int32"),       do: 4
-  def numpy_dtype_size("int16"),       do: 2
-  def numpy_dtype_size("int8"),        do: 1
-  def numpy_dtype_size("uint64"),      do: 8
-  def numpy_dtype_size("uint32"),      do: 4
-  def numpy_dtype_size("uint16"),      do: 2
-  def numpy_dtype_size("uint8"),       do: 1
-  def numpy_dtype_size("complex64"),   do: 8
-  def numpy_dtype_size("complex128"),  do: 16
 end
 ```
 
