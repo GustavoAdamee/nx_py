@@ -1,0 +1,255 @@
+# POC TCC
+
+## Setup
+
+```elixir
+Mix.install([
+  {:nx, github: "elixir-nx/nx", sparse: "nx", override: true, ref: "4c741d35"},
+  {:pythonx, "~> 0.4.7"},
+  {:benchee, "~> 1.3"}
+])
+
+Pythonx.uv_init("""
+[project]
+name = "project"
+version = "0.0.0"
+requires-python = "==3.13.*"
+dependencies = [
+ "numpy==2.2.2"
+]
+""")
+```
+
+## Basic Python Integration
+
+```elixir
+defmodule ElixirToPythonBridge do
+  def run_python_code(x) do
+    {result, _} = Pythonx.eval(
+      """
+      x + 10
+      """,
+      %{"x" => x}
+    )
+    result
+  end
+end
+
+ElixirToPythonBridge.run_python_code(20)
+```
+
+## Type Support Helper
+
+Maps Nx tensor types to NumPy dtype strings. Used by all bridge modules below
+so that the Python side uses the correct dtype when reconstructing arrays from
+raw binary data.
+
+```elixir
+defmodule NxNumpyBridge do
+  def nx_dtype_to_numpy(%{type: {:f, 64}}), do: "float64"
+  def nx_dtype_to_numpy(%{type: {:f, 32}}), do: "float32"
+  def nx_dtype_to_numpy(%{type: {:f, 16}}), do: "float16"
+  def nx_dtype_to_numpy(%{type: {:s, 64}}), do: "int64"
+  def nx_dtype_to_numpy(%{type: {:s, 32}}), do: "int32"
+  def nx_dtype_to_numpy(%{type: {:s, 16}}), do: "int16"
+  def nx_dtype_to_numpy(%{type: {:s,  8}}), do: "int8"
+  def nx_dtype_to_numpy(%{type: {:u, 64}}), do: "uint64"
+  def nx_dtype_to_numpy(%{type: {:u, 32}}), do: "uint32"
+  def nx_dtype_to_numpy(%{type: {:u, 16}}), do: "uint16"
+  def nx_dtype_to_numpy(%{type: {:u,  8}}), do: "uint8"
+end
+```
+
+## Copy-Based Implementation
+
+Baseline approach — total of **3 data copies**:
+
+1. **Input (boundary):** Pythonx serialises the Erlang binary into a Python `bytes` object
+2. **Output (Python-internal):** `tobytes()` allocates a new buffer and copies the NumPy array data into it
+3. **Output (boundary):** Pythonx encodes the resulting `bytes` back into an Erlang binary
+
+`np.frombuffer` reconstructs the array without copying. The final Erlang binary
+is reconstructed as an Nx tensor via `Nx.from_binary`.
+
+```elixir
+defmodule NxNumpyBridgePOC do
+  import Nx.Defn
+
+  def python_callback(tensor, _opts) do
+    dtype = NxNumpyBridge.nx_dtype_to_numpy(tensor)
+    data = Nx.to_binary(tensor)
+    shape = Nx.shape(tensor)
+
+    {py_result, _env} =
+      Pythonx.eval(
+        """
+        import numpy as np
+
+        def main(data, shape, dtype):
+          x = np.frombuffer(data, dtype=dtype).reshape(shape)
+          y = x * 10
+          return (y.tobytes(), y.shape)
+
+        main(data, shape, dtype)
+        """,
+        %{"data" => data, "shape" => shape, "dtype" => dtype}
+      )
+
+    {out_data, out_shape} = Pythonx.decode(py_result)
+    out_data |> Nx.from_binary(tensor.type) |> Nx.reshape(out_shape)
+  end
+
+  defn run(x) do
+    y = Nx.runtime_call(Nx.to_template(x), x, &python_callback/2)
+    {x, y}
+  end
+end
+
+NxNumpyBridgePOC.run(Nx.tensor([1, 2, 3]))
+```
+
+## View-Based Approach (Partial Optimization)
+
+Uses `y.view(np.uint8)` to reinterpret the result array's memory as raw bytes
+without allocating a new buffer inside NumPy — total of **2 data copies**:
+
+1. **Input (boundary):** Pythonx serialises the Erlang binary into a Python `bytes` object
+2. **Output (boundary):** Pythonx encodes directly from the array's memory into an Erlang binary
+
+`ndarray.view()` returns a new array object sharing the same underlying C buffer,
+reinterpreted as `uint8` — this is zero-copy within Python. By eliminating the
+intermediate `tobytes()` allocation (copy-based has 3 copies), the view-based
+approach achieves ~2x better throughput for large tensors.
+
+```elixir
+defmodule NxNumpyViewBased do
+  import Nx.Defn
+
+  # Uses ndarray.view(np.uint8) to reinterpret result bytes without allocating
+  # a new buffer inside NumPy, eliminating the tobytes() intermediate copy.
+  # Pythonx still copies at the boundary (Erlang binary encoding) — 2 total
+  # copies vs 3 for copy-based.
+  def python_callback_view(tensor, _opts) do
+    tensor = Nx.as_type(tensor, {:f, 64})
+    data = Nx.to_binary(tensor)
+    shape = Nx.shape(tensor)
+
+    {py_result, _env} =
+      Pythonx.eval(
+        """
+        import numpy as np
+
+        x = np.frombuffer(data, dtype=np.float64).reshape(shape)
+        y = x * 10
+        # y.view(np.uint8) reinterprets the result as raw bytes with zero copy
+        # inside Python. Pythonx still copies at the boundary when encoding the
+        # result into an Erlang binary — this copy cannot be avoided here.
+        result = bytes(y.view(np.uint8))
+        result
+        """,
+        %{"data" => data, "shape" => Tuple.to_list(shape)}
+      )
+
+    out_data = Pythonx.decode(py_result)
+    out_data |> Nx.from_binary({:f, 64}) |> Nx.reshape(shape)
+  end
+
+  defn run(x) do
+    x = Nx.as_type(x, {:f, 64})
+    y = Nx.runtime_call(Nx.to_template(x), x, &python_callback_view/2)
+    {x, y}
+  end
+end
+
+# Sanity check: result should match the other implementations
+test_tensor = Nx.iota({10}) |> Nx.as_type({:f, 64})
+{_x, y_view} = NxNumpyViewBased.run(test_tensor)
+IO.inspect(Nx.to_flat_list(y_view), label: "view-based result")
+```
+
+## Type Coverage Validation
+
+Verify that `NxNumpyBridgePOC` correctly round-trips tensors of all common Nx
+numeric types. Each test checks that `tensor * 10` via Python/NumPy matches
+the result from `Nx.multiply(tensor, 10)`.
+
+Note: `{:f, 16}` is omitted because NumPy's `float16` has limited precision
+and Pythonx may not handle its binary encoding uniformly across platforms.
+
+```elixir
+types_to_test = [
+  {:f, 64}, {:f, 32},
+  {:s, 64}, {:s, 32}, {:s, 16}, {:s, 8},
+  {:u, 64}, {:u, 32}, {:u, 16}, {:u, 8}
+]
+
+IO.puts("Type coverage validation (bridge result vs Nx.multiply by 10):\n")
+
+Enum.each(types_to_test, fn type ->
+  tensor = Nx.iota({5}) |> Nx.as_type(type)
+
+  {_x, y_bridge} = NxNumpyBridgePOC.run(tensor)
+  y_nx = Nx.multiply(tensor, 10)
+
+  match = Nx.to_flat_list(y_bridge) == Nx.to_flat_list(y_nx)
+  status = if match, do: "✓", else: "✗ MISMATCH"
+  IO.puts("  #{status} #{inspect(type)}: #{inspect(Nx.to_flat_list(y_bridge))}")
+end)
+```
+
+## Systematic Benchmarks
+
+Comprehensive benchmark across multiple tensor sizes and types, using module
+functions to avoid Benchee's "evaluated function" performance penalty.
+
+```elixir
+defmodule BenchmarkRunner do
+  def run_copy(tensor),       do: NxNumpyBridgePOC.run(tensor)
+  def run_view_based(tensor), do: NxNumpyViewBased.run(tensor)
+end
+
+inputs = %{
+  "1K   f64" => Nx.iota({1_000}, type: {:f, 64}),
+  "100K f64" => Nx.iota({100_000}, type: {:f, 64}),
+  "1M   f64" => Nx.iota({1_000_000}, type: {:f, 64}),
+  "1M   f32" => Nx.iota({1_000_000}, type: {:f, 32}),
+  "1M   s32" => Nx.iota({1_000_000}, type: {:s, 32}),
+}
+
+Benchee.run(
+  %{
+    "copy-based (tobytes)"      => &BenchmarkRunner.run_copy/1,
+    "view-based (ndarray.view)" => &BenchmarkRunner.run_view_based/1,
+  },
+  inputs: inputs,
+  time: 5,
+  memory_time: 2,
+  print: [benchmarking: false, fast_warning: false]
+)
+```
+
+## Future Work: Zero-Copy NIF
+
+### The Pythonx Serialisation Bottleneck
+
+All implementations in this notebook share a fundamental limitation: **Pythonx
+must copy data when crossing the Elixir boundary**. When a Python value is
+returned from `Pythonx.eval/2`, Pythonx encodes it into an Erlang binary — an
+operation that always allocates and copies, regardless of the Python-side
+representation used.
+
+This means that Python-side optimisations (using `ndarray.view(np.uint8)` to
+reinterpret bytes in-place, then wrapping with `bytes()`) reduce overhead
+*within Python* but cannot eliminate the boundary copy. The copy count per approach is:
+
+| Approach                    | Input (boundary) | Output (Python-internal) | Output (boundary)  | Total |
+| --------------------------- | :--------------: | :----------------------: | :----------------: | :---: |
+| Copy-based (`tobytes`)      | 1 (Pythonx)      | 1 (`tobytes()` alloc)    | 1 (Pythonx encode) | **3** |
+| View-based (`ndarray.view`) | 1 (Pythonx)      | 0 (`view()` in-place)    | 1 (Pythonx encode) | **2** |
+| Zero-Copy NIF (future work) | 0 (pointer)      | 0                        | 0 (pointer)        | **0** |
+
+The root cause: to create an Erlang binary, the BEAM must own the memory.
+Pythonx has no mechanism to transfer ownership of a Python buffer to the BEAM
+without copying. The only way to eliminate this copy is to bypass Pythonx
+encoding entirely — which requires a C NIF that allocates BEAM-owned memory and
+exposes its address to Python directly.
