@@ -11,7 +11,8 @@ using `Nx.to_pointer`/`Nx.from_pointer` — the official Nx API for raw memory a
 Mix.install([
   {:nx, github: "elixir-nx/nx", sparse: "nx", override: true, ref: "4c741d35"},
   {:exla, github: "elixir-nx/nx", sparse: "exla", override: true, ref: "4c741d35"},
-  {:pythonx, "~> 0.4.7"}
+  {:pythonx, "~> 0.4.7"},
+  {:kino, "~> 0.14"}
 ])
 
 # Force EXLA as default backend — tensors land on CPU (:host client)
@@ -33,11 +34,14 @@ dependencies = [
 
 Maps Nx tensor types to NumPy dtype strings. Three strategies:
 
-| Strategy          | Types                                                                                                   |
-| ----------------- | ------------------------------------------------------------------------------------------------------- |
-| **NumPy native**  | `{:f, 64}`, `{:f, 32}`, `{:f, 16}`, `{:s, 8}`-`{:s, 64}`, `{:u, 8}`-`{:u, 64}`, `{:c, 64}`, `{:c, 128}` |
-| **ml_dtypes**     | `{:bf, 16}`, `{:f, 8}` (E5M2), `{:f8_e4m3fn, 8}` (E4M3FN)                                               |
-| **Not supported** | `{:s, 2}`, `{:s, 4}`, `{:u, 2}`, `{:u, 4}` — convert to a wider type before calling the bridge        |
+| Strategy         | Types                                                                                                   |
+| ---------------- | ------------------------------------------------------------------------------------------------------- |
+| **NumPy native** | `{:f, 64}`, `{:f, 32}`, `{:f, 16}`, `{:s, 8}`-`{:s, 64}`, `{:u, 8}`-`{:u, 64}`, `{:c, 64}`, `{:c, 128}` |
+| **ml_dtypes**    | `{:bf, 16}`, `{:f, 8}` (E5M2), `{:f8_e4m3fn, 8}` (E4M3FN), `{:s, 4}`, `{:s, 2}`, `{:u, 4}`, `{:u, 2}`   |
+
+**Note on sub-byte types:** `ml_dtypes` supports `int4`/`uint4`/`int2`/`uint2`, but uses an
+**unpacked** representation (1 byte per element). EXLA packs sub-byte values (e.g., two `int4`
+values per byte). The bridge requires a pack/unpack conversion step at the boundary.
 
 ```elixir
 defmodule NxNumpyBridge do
@@ -62,6 +66,11 @@ defmodule NxNumpyBridge do
   # Complex — native NumPy
   def nx_dtype_to_numpy(%{type: {:c, 64}}),  do: "complex64"
   def nx_dtype_to_numpy(%{type: {:c, 128}}), do: "complex128"
+  # Sub-byte integers — via ml_dtypes (unpacked: 1 byte per element)
+  def nx_dtype_to_numpy(%{type: {:s, 4}}),   do: "int4"
+  def nx_dtype_to_numpy(%{type: {:s, 2}}),   do: "int2"
+  def nx_dtype_to_numpy(%{type: {:u, 4}}),   do: "uint4"
+  def nx_dtype_to_numpy(%{type: {:u, 2}}),   do: "uint2"
 end
 ```
 
@@ -94,59 +103,57 @@ types_to_test = [
   {:c, 64}, {:c, 128}
 ]
 
-header =
-  String.pad_trailing("Type", 20) <>
-  String.pad_trailing("Strategy", 12) <>
-  String.pad_trailing("Transfer", 10) <>
-  String.pad_trailing("to_pointer", 12) <>
-  String.pad_trailing("Round-trip", 12)
-
-IO.puts(header)
-IO.puts(String.duplicate("-", String.length(header)))
-
-Enum.each(types_to_test, fn type ->
-  strategy = case type do
-    {:bf, 16}        -> "ml_dtypes"
-    {:f, 8}          -> "ml_dtypes"
-    {:f8_e4m3fn, 8}  -> "ml_dtypes"
-    _                 -> "native"
-  end
-
-  {transfer_status, ptr_status, rt_status} =
-    try do
-      tensor = Nx.iota({100}) |> Nx.as_type(type) |> Nx.backend_transfer(EXLA.Backend)
-
-      # Verify to_pointer works
-      pointer = Nx.to_pointer(tensor, mode: :local)
-      %Nx.Pointer{kind: :local} = pointer
-      ptr_valid = is_integer(pointer.address) and pointer.address > 0 and is_integer(pointer.data_size) and pointer.data_size > 0
-
-      # Verify from_pointer round-trip
-      reconstructed = Nx.from_pointer({EXLA.Backend, client: :host}, pointer, type, {100})
-      original_data = Nx.to_binary(tensor) |> :binary.bin_to_list()
-      reconstructed_data = Nx.to_binary(reconstructed) |> :binary.bin_to_list()
-      rt_ok = original_data == reconstructed_data
-
-      {"ok", if(ptr_valid, do: "ok", else: "fail"), if(rt_ok, do: "ok", else: "fail")}
-    rescue
-      e -> {"error", "error", Exception.message(e) |> String.slice(0, 30)}
+results =
+  Enum.map(types_to_test, fn type ->
+    strategy = case type do
+      {:bf, 16}        -> "ml_dtypes"
+      {:f, 8}          -> "ml_dtypes"
+      {:f8_e4m3fn, 8}  -> "ml_dtypes"
+      {:s, 4}          -> "ml_dtypes"
+      {:s, 2}          -> "ml_dtypes"
+      {:u, 4}          -> "ml_dtypes"
+      {:u, 2}          -> "ml_dtypes"
+      _                 -> "native"
     end
 
-  IO.puts(
-    String.pad_trailing(inspect(type), 20) <>
-    String.pad_trailing(strategy, 12) <>
-    String.pad_trailing(transfer_status, 10) <>
-    String.pad_trailing(ptr_status, 12) <>
-    String.pad_trailing(rt_status, 12)
-  )
-end)
+    {transfer_status, ptr_status, rt_status} =
+      try do
+        tensor = Nx.iota({100}) |> Nx.as_type(type) |> Nx.backend_transfer(EXLA.Backend)
+
+        # Verify to_pointer works
+        pointer = Nx.to_pointer(tensor, mode: :local)
+        %Nx.Pointer{kind: :local} = pointer
+        ptr_valid = is_integer(pointer.address) and pointer.address > 0 and is_integer(pointer.data_size) and pointer.data_size > 0
+
+        # Verify from_pointer round-trip
+        reconstructed = Nx.from_pointer({EXLA.Backend, client: :host}, pointer, type, {100})
+        original_data = Nx.to_binary(tensor) |> :binary.bin_to_list()
+        reconstructed_data = Nx.to_binary(reconstructed) |> :binary.bin_to_list()
+        rt_ok = original_data == reconstructed_data
+
+        {"ok", if(ptr_valid, do: "ok", else: "fail"), if(rt_ok, do: "ok", else: "fail")}
+      rescue
+        e -> {"error", "error", Exception.message(e) |> String.slice(0, 30)}
+      end
+
+    "| `#{inspect(type)}` | #{strategy} | #{transfer_status} | #{ptr_status} | #{rt_status} |"
+  end)
+
+table = """
+| Type | Strategy | Transfer | to_pointer | Round-trip |
+|------|----------|----------|------------|------------|
+#{Enum.join(results, "\n")}
+"""
+
+Kino.Markdown.new(table)
 ```
 
 ### EXLA Sub-byte Types
 
-EXLA also handles sub-byte types (`{:u, 2}`, `{:u, 4}`, `{:s, 2}`, `{:s, 4}`) by unpacking
-each element to a full 8-bit byte on write and re-packing on read. These types are not
-supported by NumPy and are excluded from the bridge.
+EXLA handles sub-byte types (`{:u, 2}`, `{:u, 4}`, `{:s, 2}`, `{:s, 4}`) by packing
+multiple values per byte (e.g., two `int4` values per byte). `ml_dtypes` supports these
+types but uses an **unpacked** representation (1 byte per element). The bridge requires
+a pack/unpack conversion step when transferring sub-byte tensors between EXLA and NumPy.
 
 ## Interop Proofs
 
@@ -154,15 +161,14 @@ Three isolated proofs, each measuring **only one direction** of data flow.
 No overlap between proofs.
 
 1. **Elixir → Python (1 copy):** Pass Erlang binary to Python, measure RSS — shows `PyBytes_FromStringAndSize` copies
-2. **Python → Elixir (0 copies):** Create data entirely in Python, `decode` it, measure binary_heap — shows ~0 (resource binary)
+2. **Python → Elixir (0 copies):** Create data entirely in Python, `decode` it, measure RSS — shows ~0 (resource binary)
 3. **EXLA → Python (0 copies):** `to_pointer(:local)` + ctypes — same physical memory, no copies
 
 ```elixir
-# Helper: measure memory at each step
-# binary_heap (:erlang.memory(:binary)): only sees Erlang-side allocations.
-#   Python-side copies (PyBytes_FromStringAndSize, tobytes) are invisible.
-# rss (ps -o rss=): Resident Set Size of the BEAM process in KB.
-#   Sees ALL memory including Python allocations — shows every copy.
+# Helper: measure memory at each step via RSS (Resident Set Size).
+# RSS sees ALL memory including Python allocations — shows every copy.
+# :erlang.memory(:binary) is not used because NIF allocations (EXLA DeviceBuffers)
+# are invisible to it, making it unreliable for measuring cross-boundary copies.
 defmodule Mem do
   def rss_kb do
     pid = :os.getpid()
@@ -174,15 +180,15 @@ defmodule Mem do
     :erlang.garbage_collect()
     Pythonx.eval("import gc; gc.collect()", %{})
     :erlang.garbage_collect()
-    %{binary_heap: :erlang.memory(:binary), rss_kb: rss_kb()}
+    %{rss_kb: rss_kb()}
   end
 
   def delta(s1, s2) do
-    %{binary_heap: s2.binary_heap - s1.binary_heap, rss_kb: s2.rss_kb - s1.rss_kb}
+    %{rss_kb: s2.rss_kb - s1.rss_kb}
   end
 
   def print_delta(label, d) do
-    IO.puts("  #{String.pad_trailing(label, 22)} binary_heap: #{d.binary_heap} bytes | RSS: #{d.rss_kb} KB")
+    IO.puts("  #{String.pad_trailing(label, 22)} RSS: #{d.rss_kb} KB")
   end
 end
 ```
@@ -191,14 +197,12 @@ end
 
 Isolates the **input direction only**. An Erlang binary is passed to Python via
 Pythonx. `PyBytes_FromStringAndSize` copies the binary into Python `bytes` — this
-shows up as RSS growth but not in binary_heap (Python allocations are invisible
-to Erlang). The output is discarded — we only care about the input copy.
+shows up as RSS growth. The output is discarded — we only care about the input copy.
 
 **Note on RSS reliability:** Python's allocator reuses freed pages and does not
 return them to the OS. The RSS delta is most meaningful on the first run (fresh
 Livebook session). On subsequent runs, Python reuses the same pages and RSS
-delta may be ~0. The binary_heap delta is always reliable because Erlang GC
-properly reclaims memory between runs.
+delta may be ~0.
 
 ```elixir
 s0 = Mem.snapshot()
@@ -225,10 +229,10 @@ IO.puts("Proof 1: Elixir → Python (1 copy on input)")
 Mem.print_delta("create binary", Mem.delta(s0, s1))
 Mem.print_delta("Pythonx eval", Mem.delta(s1, s2))
 IO.puts("")
-IO.puts("  create binary: binary_heap ~+4 MB (Erlang allocates the binary), RSS mirrors it.")
-IO.puts("  Pythonx eval:  binary_heap ~0 (copy is on Python side, invisible to Erlang).")
-IO.puts("  RSS on first run grows significantly (~10-16 MB) — the 4 MB copy plus Python")
-IO.puts("  runtime overhead. On subsequent runs, Python reuses freed pages → RSS ~0.")
+IO.puts("  create binary: RSS ~+4-8 MB (Erlang allocates the binary).")
+IO.puts("  Pythonx eval:  RSS grows significantly (~10-16 MB on first run) —")
+IO.puts("  the 4 MB copy (PyBytes_FromStringAndSize) plus Python runtime overhead.")
+IO.puts("  On subsequent runs, Python reuses freed pages → RSS ~0.")
 IO.puts("  Contrast with Proof 3 (~16 KB first run) proves this is a data copy, not just call overhead.")
 ```
 
@@ -237,8 +241,7 @@ IO.puts("  Contrast with Proof 3 (~16 KB first run) proves this is a data copy, 
 Isolates the **output direction only**. Data is created entirely in Python — no
 Elixir binary input at all. When Python returns `bytes`, Pythonx uses
 `enif_make_resource_binary` to create an Erlang binary that points directly into
-the Python buffer. No `memcpy` occurs — binary_heap and RSS should show ~0 delta
-on `decode`.
+the Python buffer. No `memcpy` occurs — RSS should show ~0 delta on `decode`.
 
 ```elixir
 # Create 1M float32 values entirely in Python — no Elixir input
@@ -268,8 +271,8 @@ Mem.print_delta("Pythonx eval", Mem.delta(s0, s1))
 Mem.print_delta("decode", Mem.delta(s1, s2))
 IO.puts("  Correct: #{Nx.to_flat_list(result_p2) == Nx.to_flat_list(expected_p2)}")
 IO.puts("")
-IO.puts("  Expected: decode ~0 in both metrics — enif_make_resource_binary")
-IO.puts("  creates an Erlang binary pointing into the Python buffer, no memcpy.")
+IO.puts("  Expected: decode RSS ~0 — enif_make_resource_binary creates an Erlang")
+IO.puts("  binary pointing into the Python buffer, no memcpy.")
 IO.puts("  The Pythonx eval delta includes Python computation + the bytes object,")
 IO.puts("  but the decode step itself adds ~0 because no new 4 MB buffer is allocated.")
 ```
@@ -332,9 +335,9 @@ IO.puts("\nProof 3: EXLA → Python (zero-copy via to_pointer)")
 Mem.print_delta("Pythonx eval", Mem.delta(s0, s1))
 IO.puts("  Correct: #{Nx.to_flat_list(result_p3) == Nx.to_flat_list(expected_p3)}")
 IO.puts("")
-IO.puts("  Expected: ~0 in both metrics — no data copied at any boundary.")
+IO.puts("  Expected: RSS ~0 — no data copied at any boundary.")
 IO.puts("  Python reads/writes the same physical memory as the EXLA DeviceBuffer.")
-IO.puts("  Contrast with Proof 1 where Pythonx eval showed ~4 MB in RSS.")
+IO.puts("  Contrast with Proof 1 where Pythonx eval showed ~10-16 MB RSS growth.")
 ```
 
 ### Proof 3 Verification: First 10 Elements
@@ -362,8 +365,8 @@ physical memory as the EXLA DeviceBuffer via `ctypes.from_address`, with no data
 
 **OBS:** EXLA also supports `mode: :ipc` for cross-process sharing via
 POSIX shared memory (`shm_open`/`mmap`). Since Pythonx runs CPython in the same BEAM
-process `:local` mode is sufficient. 
-FOr `:ipc`
+process `:local` mode is sufficient.
+For `:ipc`
 (e.g., for a separate Python worker process), note that PR [elixir-nx/nx#1732](https://github.com/elixir-nx/nx/pull/1732)
 (changed the default shared memory permissions to `0o400` (owner-read-only) — use
 `shm_permissions: 0o600` for read-write access).
