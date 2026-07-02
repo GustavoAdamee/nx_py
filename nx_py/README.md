@@ -90,6 +90,16 @@ numpy_view = np.frombuffer(arr, dtype=np.dtype(ref["dtype"])) \
 # numpy_view shares memory with the EXLA DeviceBuffer — no copy.
 ```
 
+## Compatibility matrix
+
+Which backend/Python-library combinations are currently supported. New rows/columns can be added as more backends and Python libraries are implemented.
+
+| Backend \ Python library | `NxPy.PythonLib.Numpy` | ... |
+|---|:---:|:---:|
+| `NxPy.Backend.Binary` | X | |
+| `NxPy.Backend.EXLA` | X | |
+| ... | | |
+
 ## Type coverage
 
 `NxPy.PythonLib.Numpy` maps every Nx type to a NumPy dtype:
