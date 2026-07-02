@@ -2,7 +2,7 @@
 
 Plug-and-play interoperability between [Nx](https://github.com/elixir-nx/nx) tensors and Python.
 
-NxPy lets an Elixir application share tensor data with an embedded Python runtime (via [Pythonx](https://github.com/CocoaDao/pythonx)) without forcing a particular Nx backend or Python library on you. Backends and Python library adapters are pluggable through two behaviours, so the same `NxPy.to_python/1` / `NxPy.from_python/2` API works whether you're using the copy-based `Nx.BinaryBackend` path or the zero-copy `EXLA` pointer path.
+NxPy lets an Elixir application share tensor data with an embedded Python runtime (via [Pythonx](https://github.com/livebook-dev/pythonx)) without forcing a particular Nx backend or Python library on you. Backends and Python library adapters are pluggable through two behaviours, so the same `NxPy.to_python/1` / `NxPy.from_python/2` API works whether you're using the copy-based `Nx.BinaryBackend` path or the zero-copy `EXLA` pointer path.
 
 > This project is part of an undergraduate capstone thesis (TCC) at UTFPR investigating Nx ↔ Python interoperability. The focus is **interoperability** — how tensor data crosses the Elixir/Python boundary — not raw performance.
 
@@ -101,7 +101,7 @@ Sub-byte integers (`{:s, 2}`, `{:s, 4}`, `{:u, 2}`, `{:u, 4}`) are widened to 8-
 
 ## Installation
 
-`nx_py` is not published to Hex. To use it, add it as a path dependency from a sibling checkout of the [nx](https://github.com/elixir-nx/nx) monorepo:
+`nx_py` is not published yet.
 
 ```elixir
 def deps do
@@ -185,4 +185,4 @@ end
 
 ## License
 
-See the repository for license information.
+TODO
