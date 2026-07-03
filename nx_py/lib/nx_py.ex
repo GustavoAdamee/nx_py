@@ -2,30 +2,49 @@ defmodule NxPy do
   @moduledoc """
   Plug-and-play interoperability between Nx tensors and Python.
 
+  Tensors can be passed directly as `Pythonx.eval` globals — the
+  `Pythonx.Encoder` implementation for `Nx.Tensor` (see `NxPy.Encoder`)
+  handles the per-backend conversion automatically. `from_python/2`
+  reconstructs an `Nx.Tensor` from an `nx_py.NxTensor` Python object
+  returned by Python code.
+
   ## Quick start
 
-      # Configure at startup
-      NxPy.configure(backend: NxPy.Backend.Binary, python_lib: NxPy.PythonLib.Numpy)
+      # Initialize the bundled Python environment (installs numpy, ml-dtypes,
+      # and the nx_py package that defines NxTensor)
+      NxPy.init_python()
 
-      # Convert tensor to Python reference
-      ref = NxPy.to_python(tensor)
+      # Elixir -> Python: any Nx.Tensor works directly as a Pythonx.eval global
+      tensor = Nx.iota({5}, type: {:s, 32}) |> Nx.backend_transfer(EXLA.Backend)
 
-      # Use ref fields (pointer, data, dtype, shape, data_size) in Pythonx.eval
-      # ...
+      {result, _} = Pythonx.eval(
+        \"\"\"
+        arr = tensor.array          # tensor is an nx_py.NxTensor; arr is a real numpy array
+        arr *= 10                   # in-place: writes straight into the EXLA DeviceBuffer
+        tensor
+        \"\"\",
+        %{\"tensor\" => tensor}
+      )
 
-      # Reconstruct tensor from Python
-      tensor = NxPy.from_python(ref, type: {:s, 32}, shape: {5})
+      # Python -> Elixir: reconstruct from whatever NxTensor Python hands back
+      updated = NxPy.from_python(result, backend: EXLA.Backend)
+
+      # `tensor` isn't referenced again above, so without this line the BEAM
+      # could free its DeviceBuffer before `updated` (which aliases the same
+      # memory) is read. See "GC safety" on `from_python/2` below.
+      send(self(), {:keep_alive, tensor})
   """
 
-  alias NxPy.Config
-
-  @base_deps ["numpy==2.2.2", "ml-dtypes==0.5.0"]
   @default_python_version "==3.13.*"
 
   @doc """
   Initializes the Python environment via `Pythonx.uv_init/1`.
 
-  Sets up a Python project with NumPy and ml-dtypes as base dependencies.
+  Installs NumPy, ml-dtypes, and the bundled `nx_py` Python package (which
+  defines the `NxTensor` class the encoder imports). The bundled package is
+  referenced as a local editable path dependency, resolved at runtime via
+  `Application.app_dir(:nx_py, "priv/python")` — works whether `nx_py` is a
+  path, git, or Hex dependency.
 
   ## Options
 
@@ -44,11 +63,16 @@ defmodule NxPy do
 
   @doc false
   def build_toml(opts \\ []) do
+    py_src_path = Application.app_dir(:nx_py, "priv/python")
     extra_deps = Keyword.get(opts, :extra_deps, [])
     python_version = Keyword.get(opts, :python_version, @default_python_version)
-    all_deps = @base_deps ++ extra_deps
 
-    deps_str = all_deps |> Enum.map(&~s(  "#{&1}")) |> Enum.join(",\n")
+    dependencies = ["nx_py @ #{py_src_path}" | extra_deps]
+
+    deps_str =
+      dependencies
+      |> Enum.map(&~s(  "#{&1}"))
+      |> Enum.join(",\n")
 
     """
     [project]
@@ -58,68 +82,93 @@ defmodule NxPy do
     dependencies = [
     #{deps_str}
     ]
+
+    [tool.uv.sources]
+    nx_py = { path = "#{py_src_path}", editable = true }
+
+    [tool.uv]
+    reinstall-package = ["nx_py"]
     """
   end
 
   @doc """
-  Configures the nx_py library at runtime.
+  Encodes a tensor for Python. Thin convenience over `Pythonx.encode!/1`.
 
-  ## Options
-
-    * `:backend` — module implementing `NxPy.Backend` (e.g. `NxPy.Backend.EXLA`, `NxPy.Backend.Binary`)
-    * `:python_lib` — module implementing `NxPy.PythonLib` (e.g. `NxPy.PythonLib.Numpy`)
-
-  ## Examples
-
-      NxPy.configure(backend: NxPy.Backend.EXLA, python_lib: NxPy.PythonLib.Numpy)
-  """
-  def configure(opts) do
-    backend = Keyword.fetch!(opts, :backend)
-    python_lib = Keyword.fetch!(opts, :python_lib)
-    Config.set(%{backend: backend, python_lib: python_lib})
-  end
-
-  @doc """
-  Converts an Nx tensor into a Python reference map.
-
-  Returns a map containing everything Python needs to access the tensor data:
-
-    * `:pointer` — raw memory address (zero-copy), or `nil` (copy-based)
-    * `:data` — binary data (copy-based), or `nil` (zero-copy)
-    * `:data_size` — size of the data in bytes
-    * `:dtype` — Python dtype string (e.g. `"float32"`, `"int32"`)
-    * `:shape` — tensor shape as a list
-    * `:tensor_ref` — reference to the original tensor (keeps DeviceBuffer alive)
-    * `:mode` — `:zero_copy` or `:copy_based`
-
-  ## Examples
-
-      ref = NxPy.to_python(tensor)
-      # Use ref.pointer and ref.dtype with ctypes.from_address in Python
+  In practice you don't need this — passing the tensor directly as a
+  `Pythonx.eval` global dispatches through the `Pythonx.Encoder` impl
+  automatically. Kept for explicitness and symmetry with `from_python/2`.
   """
   def to_python(tensor) do
-    config = Config.get()
-    dtype = config.python_lib.nx_to_dtype(tensor)
-    ref = config.backend.to_python_ref(tensor)
-    Map.put(ref, :dtype, dtype)
+    Pythonx.encode!(tensor)
   end
 
   @doc """
-  Reconstructs an Nx tensor from a Python reference map.
+  Reconstructs an `Nx.Tensor` from an `nx_py.NxTensor` Python object.
+
+  Reads `.pointer`, `.dtype`, and `.shape` off the object via a single
+  `Pythonx.eval` + `Pythonx.decode/1`, then rebuilds the tensor through
+  the chosen backend.
 
   ## Options
 
-    * `:type` — the Nx type of the result tensor (e.g. `{:s, 32}`, `{:f, 64}`)
-    * `:shape` — the shape of the result tensor (e.g. `{5}`, `{2, 3}`)
+    * `:backend` — `EXLA.Backend` (zero-copy, aliases the original buffer) or
+      `Nx.BinaryBackend` (default; copy-based).
 
-  ## Examples
+  `obj` does **not** need to be the same object originally sent to Python —
+  any `NxTensor` instance works, since all needed metadata lives on the
+  object itself.
 
-      tensor = NxPy.from_python(ref, type: {:s, 32}, shape: {5})
+  ## GC safety (EXLA path)
+
+  The reconstructed EXLA tensor aliases the memory of the original buffer.
+  The original tensor must outlive not just the `eval` but also any use of
+  the reconstructed tensor — otherwise the reconstructed tensor reads freed
+  memory. This is inherent to zero-copy aliasing.
+
+  Merely keeping the original tensor lexically in scope is **not enough**:
+  if it is never referenced again after being sent to Python, the BEAM's
+  liveness analysis can consider it dead and collect its `DeviceBuffer`
+  before the reconstructed tensor is read, even while still "in scope" of
+  the same function. The caller must add an explicit reference after the
+  last use of the reconstructed tensor, for example:
+
+      send(self(), {:keep_alive, original_tensor})
+
   """
-  def from_python(ref, opts) do
-    config = Config.get()
-    type = Keyword.fetch!(opts, :type)
-    shape = Keyword.fetch!(opts, :shape)
-    config.backend.from_python_ref(ref, type, shape)
+  def from_python(%Pythonx.Object{} = obj, opts \\ []) do
+    backend = Keyword.get(opts, :backend, Nx.BinaryBackend)
+
+    case backend do
+      EXLA.Backend ->
+        {pointer, data_size, dtype_str, shape} = read_pointer_fields(obj)
+        type = NxPy.Dtype.from_numpy(dtype_str)
+        ptr = %Nx.Pointer{kind: :local, address: pointer, data_size: data_size}
+        Nx.from_pointer(EXLA.Backend, ptr, type, shape)
+
+      Nx.BinaryBackend ->
+        {binary, dtype_str, shape} = read_binary_fields(obj)
+        type = NxPy.Dtype.from_numpy(dtype_str)
+        binary |> Nx.from_binary(type) |> Nx.reshape(shape)
+    end
+  end
+
+  defp read_pointer_fields(obj) do
+    {result, %{}} =
+      Pythonx.eval(
+        "(obj.pointer, obj.array.nbytes, obj.dtype, tuple(obj.shape))",
+        %{"obj" => obj}
+      )
+
+    Pythonx.decode(result)
+  end
+
+  defp read_binary_fields(obj) do
+    {result, %{}} =
+      Pythonx.eval(
+        "(obj.array.tobytes(), obj.dtype, tuple(obj.shape))",
+        %{"obj" => obj}
+      )
+
+    Pythonx.decode(result)
   end
 end
