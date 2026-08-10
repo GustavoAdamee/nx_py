@@ -26,7 +26,7 @@ defmodule NxPy.EncoderTest do
     end
   end
 
-  describe "encode_exla/1 (no Pythonx — structural checks only)" do
+  describe "encode_pointer/1 (no Pythonx — structural checks only)" do
     setup do
       Application.put_env(:nx, :default_backend, {EXLA.Backend, client: :host})
       :ok

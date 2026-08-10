@@ -54,6 +54,18 @@ defmodule NxPy.IntegrationTest do
   end
 
   describe "Pythonx.Encoder for Nx.Tensor — EXLA backend (zero-copy, in-place)" do
+    test "from_python_owned/3 retains the zero-copy buffer owner across garbage collection" do
+      original = Nx.iota({5}, type: {:s, 32}) |> Nx.backend_transfer(EXLA.Backend)
+
+      {result, _} = Pythonx.eval("tensor", %{"tensor" => original})
+      owned = NxPy.from_python_owned(result, original, backend: EXLA.Backend)
+
+      :erlang.garbage_collect()
+
+      assert Nx.to_flat_list(elem(owned, 0)) == [0, 1, 2, 3, 4]
+      assert elem(owned, 1) == original
+    end
+
     test "in-place mutation of tensor.array writes into the DeviceBuffer" do
       tensor = Nx.iota({5}, type: {:s, 32}) |> Nx.backend_transfer(EXLA.Backend)
 
@@ -67,18 +79,12 @@ defmodule NxPy.IntegrationTest do
           %{"tensor" => tensor}
         )
 
-      reconstructed = NxPy.from_python(result, backend: EXLA.Backend)
+      owned = NxPy.from_python_owned(result, tensor, backend: EXLA.Backend)
+      reconstructed = elem(owned, 0)
 
       assert Nx.to_flat_list(reconstructed) == [0, 10, 20, 30, 40]
 
-      # `tensor` is not referenced again after the `Pythonx.eval` call above,
-      # so without this line the BEAM's liveness analysis can consider it
-      # dead and collect its DeviceBuffer *before* `reconstructed` (which
-      # aliases the same memory) has been read — merely being lexically in
-      # scope is NOT enough. This explicit reference pins `tensor`'s
-      # liveness through the assertion above. See NxPy.from_python/2's
-      # "GC safety" docs.
-      send(self(), {:keep_alive, tensor})
+      assert elem(owned, 1) == tensor
     end
 
     test "separate output tensor preserves the input" do
@@ -98,7 +104,9 @@ defmodule NxPy.IntegrationTest do
           %{"input" => input_tensor, "output" => output_tensor}
         )
 
-      reconstructed = NxPy.from_python(result, backend: EXLA.Backend)
+      owned = NxPy.from_python_owned(result, output_tensor, backend: EXLA.Backend)
+
+      reconstructed = elem(owned, 0)
       expected = Nx.multiply(Nx.iota({1000}, type: {:f, 32}), 10.0)
 
       assert Nx.to_flat_list(reconstructed |> Nx.slice_along_axis(0, 5)) == [
@@ -120,10 +128,7 @@ defmodule NxPy.IntegrationTest do
                4.0
              ]
 
-      # Keep both source tensors alive until every read of `reconstructed`
-      # above has completed — see the keep-alive comment in the previous
-      # test for why this is necessary.
-      send(self(), {:keep_alive, {input_tensor, output_tensor}})
+      assert elem(owned, 1) == output_tensor
     end
   end
 

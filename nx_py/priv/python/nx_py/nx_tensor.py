@@ -15,3 +15,13 @@ class NxTensor:
     @property
     def shape(self):
         return self.array.shape
+
+    def to_nx(self, mode):
+        metadata = (self.dtype, self.shape)
+
+        if mode == "pointer":
+            return (self.pointer, self.array.nbytes, *metadata)
+        if mode == "binary":
+            return (self.array.tobytes(), *metadata)
+
+        raise ValueError(f"unsupported Nx conversion mode: {mode}")

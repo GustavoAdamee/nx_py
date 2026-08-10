@@ -73,15 +73,11 @@ input_tensor = Nx.iota({5}, type: {:s, 32}) |> Nx.backend_transfer(EXLA.Backend)
     %{"tensor" => input_tensor}
   )
 
-result_tensor = NxPy.from_python(result, backend: EXLA.Backend)
+owned = NxPy.from_python_owned(result, input_tensor, backend: EXLA.Backend)
+result_tensor = elem(owned, 0)
 Assert.assert!("exla in-place round-trip correct", Nx.to_flat_list(result_tensor) == [0, 10, 20, 30, 40])
 
-# `input_tensor` is not referenced again after the `Pythonx.eval` call above,
-# so without this line the BEAM's liveness analysis can consider it dead and
-# collect its DeviceBuffer *before* `result_tensor` (which aliases the same
-# memory) has been read — merely being lexically in scope is NOT enough.
-# See NxPy.from_python/2's "GC safety" docs.
-send(self(), {:keep_alive, input_tensor})
+Assert.assert!("owner retained", elem(owned, 1) == input_tensor)
 
 IO.puts("")
 
@@ -103,14 +99,13 @@ output_tensor = Nx.broadcast(Nx.tensor(0.0, type: {:f, 32}), {1000}) |> Nx.backe
     %{"input" => input_tensor, "output" => output_tensor}
   )
 
-result_tensor = NxPy.from_python(result, backend: EXLA.Backend)
+owned = NxPy.from_python_owned(result, output_tensor, backend: EXLA.Backend)
+
+result_tensor = elem(owned, 0)
 expected = Nx.multiply(Nx.iota({1000}, type: {:f, 32}), 10.0)
 Assert.assert!("exla separate output correct", Nx.to_flat_list(result_tensor) == Nx.to_flat_list(expected))
 
-# Keep both source tensors alive until every read of `result_tensor` above
-# has completed — see the keep-alive comment in the previous section for why
-# this is necessary.
-send(self(), {:keep_alive, {input_tensor, output_tensor}})
+Assert.assert!("output owner retained", elem(owned, 1) == output_tensor)
 
 IO.puts("")
 
@@ -280,26 +275,24 @@ s0 = Mem.snapshot()
 {result, _} =
   Pythonx.eval(
     """
+    import numpy as np
     in_arr = input.array
     out_arr = output.array
-    out_arr[:] = in_arr * 10
+    np.multiply(in_arr, 10, out=out_arr)
     output
     """,
     %{"input" => zc_input, "output" => zc_output}
   )
 
 s1 = Mem.snapshot()
-zc_result = NxPy.from_python(result, backend: EXLA.Backend)
+zc_owned = NxPy.from_python_owned(result, zc_output, backend: EXLA.Backend)
+zc_result = elem(zc_owned, 0)
 zero_copy_eval_rss = Mem.delta(s0, s1).rss_kb
 
 Mem.print_delta("Pythonx eval", Mem.delta(s0, s1))
 Assert.assert!("zero-copy round-trip correct", Nx.to_flat_list(zc_result |> Nx.slice_along_axis(0, 5)) == [0.0, 10.0, 20.0, 30.0, 40.0])
 
-# Critical here: `Mem.snapshot/0` calls `:erlang.garbage_collect()` directly,
-# which makes the BEAM GC hazard far more likely to trigger. Without this
-# line, `zc_output`'s DeviceBuffer could be collected before `zc_result`
-# (which aliases the same memory) is read above.
-send(self(), {:keep_alive, {zc_input, zc_output}})
+Assert.assert!("zero-copy output owner retained", elem(zc_owned, 1) == zc_output)
 
 IO.puts("")
 

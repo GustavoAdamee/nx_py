@@ -12,22 +12,22 @@ NxPy lets an Elixir application share tensor data with an embedded Python runtim
 Nx tensor (any supported backend)
         │
         ▼  (passed as a Pythonx.eval global)
-Pythonx.Encoder for Nx.Tensor  ──►  NxPy.Encoder.encode_exla/1   (zero-copy, EXLA)
+Pythonx.Encoder for Nx.Tensor  ──►  NxPy.Encoder.encode_pointer/1 (zero-copy)
                                   ──║  NxPy.Encoder.encode_binary/1 (copy-based, Binary)
                                     ║
                                     ▼
                           nx_py.NxTensor (Python object wrapping a numpy array)
                                     │
                                     ▼  (returned from Pythonx.eval)
-                          NxPy.from_python/2  ──►  Nx tensor
+                    NxPy.from_python_owned/3 ──►  {Nx tensor, buffer owner}
 ```
 
-Two backends are supported out of the box, dispatched by inspecting `tensor.data`:
+Backends are dispatched by inspecting `tensor.data`:
 
-- **`EXLA.Backend`** — zero-copy. `Nx.to_pointer(tensor, mode: :local)` yields a raw address; a NumPy view is built over it via `ctypes`/`frombuffer` and wrapped in `NxTensor`. Mutations in Python are visible on the DeviceBuffer.
+- **Pointer-capable backends, including `EXLA.Backend`** — zero-copy. `Nx.to_pointer(tensor, mode: :local)` yields a raw address; a NumPy view is built over it via `ctypes`/`frombuffer` and wrapped in `NxTensor`. Mutations in Python are visible on the backend buffer.
 - **`Nx.BinaryBackend`** — copy-based. `Nx.to_binary/1` produces bytes; `frombuffer(...).copy().reshape(shape)` builds a Python-owned NumPy array wrapped in `NxTensor`.
 
-Other backends raise a `Protocol.UndefinedError` naming the offending struct.
+Backends without pointer support raise a `Protocol.UndefinedError` naming the offending struct.
 
 A small Python package bundled with `nx_py` (installed as a local editable `uv` dependency) defines the `NxTensor` class, so the Elixir side always knows what shape of object Python hands back on `from_python/2`.
 
@@ -39,7 +39,7 @@ A small Python package bundled with `nx_py` (installed as a local editable `uv` 
 NxPy.init_python()
 
 # Elixir -> Python: any Nx.Tensor works directly as a Pythonx.eval global
-tensor = Nx.iota({5}, type: {:s, 32}) |> Nx.backend_transfer(EXLA.Backend)
+tensor = Nx.iota({5}, type: {:s, 32}, backend: EXLA.Backend)
 
 {result, _} = Pythonx.eval(
   """
@@ -50,16 +50,13 @@ tensor = Nx.iota({5}, type: {:s, 32}) |> Nx.backend_transfer(EXLA.Backend)
   %{"tensor" => tensor}
 )
 
-# Python -> Elixir: reconstruct from whatever NxTensor Python hands back
-updated = NxPy.from_python(result, backend: EXLA.Backend)
-
-# `tensor` isn't referenced again above, so without this line the BEAM
-# could free its DeviceBuffer before `updated` (which aliases the same
-# memory) is read. See "GC safety" below.
-send(self(), {:keep_alive, tensor})
+# Reconstruct and retain the original buffer owner together
+owned = NxPy.from_python_owned(result, tensor, backend: EXLA.Backend)
+updated = elem(owned, 0)
+# Keep or return `owned` for as long as `updated` is needed.
 ```
 
-No `NxPy.configure/1` call, no `:type`/`:shape` opts — `from_python/2` reads shape/dtype off the returned `NxTensor` itself. `backend:` selects the reconstruction path (defaults to `Nx.BinaryBackend`, i.e. a copy).
+No `NxPy.configure/1` call, no `:type`/`:shape` opts — reconstruction reads shape/dtype from the returned `NxTensor`. `backend:` selects the reconstruction path and defaults to `Nx.default_backend/0`.
 
 `NxPy.to_python/1` is kept only as a thin, documented wrapper around `Pythonx.encode!/1`, since `Pythonx.Encoder` dispatch makes it unnecessary in practice — tensors just work as `Pythonx.eval` globals.
 
@@ -82,11 +79,12 @@ The generated `pyproject.toml` includes a `tool.uv.sources` table and `reinstall
 
 ## Compatibility matrix
 
-| Backend | Pythonx.Encoder for Nx.Tensor | `from_python/2` |
+| Backend | Pythonx.Encoder for Nx.Tensor | Reconstruction |
 |---|:---:|:---:|
 | `EXLA.Backend` | X (zero-copy) | X (`Nx.from_pointer/4`) |
 | `Nx.BinaryBackend` | X (copy-based) | X (`Nx.from_binary/2` + `Nx.reshape/2`) |
-| other | raises `Protocol.UndefinedError` | n/a |
+| Other pointer-capable backend | X (zero-copy) | X (`Nx.from_pointer/4`) |
+| Backend without pointer support | raises `Protocol.UndefinedError` | raises `ArgumentError` |
 
 ## Type coverage
 
@@ -97,11 +95,12 @@ The generated `pyproject.toml` includes a `tool.uv.sources` table and `reinstall
 
 Sub-byte integers (`{:s, 2}`, `{:s, 4}`, `{:u, 2}`, `{:u, 4}`) are widened to 8-bit on the EXLA encode path before being passed to Python, because EXLA packs sub-byte values while NumPy/`ml_dtypes` stores them unpacked (1 byte per element). On the return path they arrive as `int8`/`uint8`; the caller can `Nx.as_type/2` manually if the original sub-byte type matters (documented non-goal of this refactor — may expand in the future).
 
-## GC safety (EXLA zero-copy path)
+## GC safety (zero-copy path)
 
 - The original Elixir `tensor` variable must stay in scope for the duration of the `Pythonx.eval` call that encodes it (normal Elixir variable scoping across the call achieves this — no extra bookkeeping needed).
-- The reconstructed EXLA tensor aliases the memory of the original buffer. The original tensor must outlive not just the `eval` but also any use of the reconstructed tensor — otherwise the reconstructed tensor reads freed memory. This is inherent to zero-copy aliasing and is called out in the `from_python/2` docs.
-- **Merely being lexically in scope is not enough.** If the original tensor is never referenced again after being sent to Python, the BEAM's liveness analysis can consider it dead and collect its `DeviceBuffer` before the reconstructed tensor is read — even while the variable is still technically "in scope" of the enclosing function. Add an explicit reference after the last use of the reconstructed tensor, e.g. `send(self(), {:keep_alive, tensor})`, as shown in the Quick start example above.
+- The reconstructed tensor aliases the memory of the original buffer. The original tensor must outlive not just the `eval` but also any use of the reconstructed tensor — otherwise the reconstructed tensor reads freed memory. This is inherent to zero-copy aliasing and is called out in the `from_python/2` docs.
+- **Merely being lexically in scope is not enough.** Once the original tensor is no longer referenced, the BEAM may collect its `DeviceBuffer` before the reconstructed tensor is read.
+- Use `NxPy.from_python_owned/3` and keep its `{reconstructed, owner}` tuple intact while the reconstructed tensor is needed. Return it from a regular function or store it directly in `GenServer` state. This makes ownership explicit without relying on mailbox messages or the process dictionary.
 - **Known limitation (sub-byte EXLA widening):** for `{:s,4}`/`{:s,2}`/`{:u,4}`/`{:u,2}` on `EXLA.Backend`, the encoder allocates a *transient* widened `DeviceBuffer` and the NumPy view wraps that transient buffer. Because the encoder returns only a `Pythonx.Object` (no Elixir-side handle survives), that widened buffer has no BEAM reference and may be collected before the caller's `eval` body runs — a use-after-free window. This refactor **does not fix this**; non-sub-byte EXLA types are unaffected. A future revision could copy sub-byte types like the Binary path, or thread a retained handle through.
 
 ## Installation
@@ -151,32 +150,7 @@ lib/nx_py/dtype.ex          →  test/nx_py/dtype_test.exs     (to_numpy/from_nu
 
 ### Add a new backend
 
-Add a `case` clause to the `defimpl Pythonx.Encoder, for: Nx.Tensor` block in `lib/nx_py/encoder.ex`. Implement an `encode_<backend>/1` function in `NxPy.Encoder` following the pattern of `encode_exla/1`/`encode_binary/1`, and add a matching reconstruction clause in `NxPy.from_python/2`:
-
-```elixir
-# in NxPy.Encoder
-def encode_mybackend(tensor) do
-  # ...build a Pythonx.Object wrapping an nx_py.NxTensor...
-end
-
-# in the defimpl block
-def encode(tensor, _encoder) do
-  case tensor.data do
-    %MyBackend{} -> NxPy.Encoder.encode_mybackend(tensor)
-    # ...existing clauses...
-  end
-end
-
-# in NxPy.from_python/2
-def from_python(%Pythonx.Object{} = obj, opts \\ []) do
-  backend = Keyword.get(opts, :backend, Nx.BinaryBackend)
-
-  case backend do
-    MyBackend -> # ...reconstruct from obj's fields...
-    # ...existing clauses...
-  end
-end
-```
+Backends that implement Nx's pointer callbacks use the zero-copy path automatically. `Nx.BinaryBackend` uses the copy-based path. A custom backend therefore only needs to implement the appropriate Nx backend callbacks; no nx_py-specific dispatch clause is required.
 
 ### Add a new Python library
 

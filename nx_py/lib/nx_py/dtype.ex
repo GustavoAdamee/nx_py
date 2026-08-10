@@ -10,54 +10,39 @@ defmodule NxPy.Dtype do
   `ml_dtypes` strings.
   """
 
-  # Standard floats — native NumPy
-  def to_numpy({:f, 64}), do: "float64"
-  def to_numpy({:f, 32}), do: "float32"
-  def to_numpy({:f, 16}), do: "float16"
+  @types [
+    {{:f, 64}, "float64"},
+    {{:f, 32}, "float32"},
+    {{:f, 16}, "float16"},
+    {{:bf, 16}, "bfloat16"},
+    {{:f, 8}, "float8_e5m2"},
+    {{:f8_e4m3fn, 8}, "float8_e4m3fn"},
+    {{:s, 64}, "int64"},
+    {{:s, 32}, "int32"},
+    {{:s, 16}, "int16"},
+    {{:s, 8}, "int8"},
+    {{:u, 64}, "uint64"},
+    {{:u, 32}, "uint32"},
+    {{:u, 16}, "uint16"},
+    {{:u, 8}, "uint8"},
+    {{:c, 64}, "complex64"},
+    {{:c, 128}, "complex128"}
+  ]
 
-  # Brain float and fp8 — via ml_dtypes
-  def to_numpy({:bf, 16}), do: "bfloat16"
-  def to_numpy({:f, 8}), do: "float8_e5m2"
-  def to_numpy({:f8_e4m3fn, 8}), do: "float8_e4m3fn"
+  @subbyte_types [
+    {{:s, 4}, "int4"},
+    {{:s, 2}, "int2"},
+    {{:u, 4}, "uint4"},
+    {{:u, 2}, "uint2"}
+  ]
 
-  # Signed integers — native NumPy
-  def to_numpy({:s, 64}), do: "int64"
-  def to_numpy({:s, 32}), do: "int32"
-  def to_numpy({:s, 16}), do: "int16"
-  def to_numpy({:s, 8}), do: "int8"
+  for {nx_type, numpy_type} <- @types ++ @subbyte_types do
+    def to_numpy(unquote(nx_type)), do: unquote(numpy_type)
+  end
 
-  # Unsigned integers — native NumPy
-  def to_numpy({:u, 64}), do: "uint64"
-  def to_numpy({:u, 32}), do: "uint32"
-  def to_numpy({:u, 16}), do: "uint16"
-  def to_numpy({:u, 8}), do: "uint8"
-
-  # Complex — native NumPy
-  def to_numpy({:c, 64}), do: "complex64"
-  def to_numpy({:c, 128}), do: "complex128"
-
-  # Sub-byte integers — via ml_dtypes (unpacked: 1 byte per element)
-  def to_numpy({:s, 4}), do: "int4"
-  def to_numpy({:s, 2}), do: "int2"
-  def to_numpy({:u, 4}), do: "uint4"
-  def to_numpy({:u, 2}), do: "uint2"
-
-  # Inverse of to_numpy/1. Sub-byte types are intentionally absent on the
-  # return path (they arrive widened as int8/uint8 — see module docs).
-  def from_numpy("float64"), do: {:f, 64}
-  def from_numpy("float32"), do: {:f, 32}
-  def from_numpy("float16"), do: {:f, 16}
-  def from_numpy("bfloat16"), do: {:bf, 16}
-  def from_numpy("float8_e5m2"), do: {:f, 8}
-  def from_numpy("float8_e4m3fn"), do: {:f8_e4m3fn, 8}
-  def from_numpy("int64"), do: {:s, 64}
-  def from_numpy("int32"), do: {:s, 32}
-  def from_numpy("int16"), do: {:s, 16}
-  def from_numpy("int8"), do: {:s, 8}
-  def from_numpy("uint64"), do: {:u, 64}
-  def from_numpy("uint32"), do: {:u, 32}
-  def from_numpy("uint16"), do: {:u, 16}
-  def from_numpy("uint8"), do: {:u, 8}
-  def from_numpy("complex64"), do: {:c, 64}
-  def from_numpy("complex128"), do: {:c, 128}
+  # Sub-byte types are intentionally absent on the return path: the encoder
+  # widens them to int8/uint8 before Python sees them.
+  for {nx_type, numpy_type} <- @types do
+    def from_numpy(unquote(numpy_type)), do: unquote(nx_type)
+  end
 end

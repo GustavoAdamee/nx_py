@@ -71,12 +71,11 @@ IO.puts("Correct: #{Nx.to_flat_list(result_tensor) == Nx.to_flat_list(Nx.multipl
 
 EXLA tensor passed as a global; Python mutates `tensor.array` in place
 (`arr *= 10`, writing straight into the `DeviceBuffer`); reconstruct with
-`NxPy.from_python/2`. The original tensor is kept alive past the last read
-of the reconstructed tensor via an explicit `send(self(), {:keep_alive, ...})`
-(see README's "GC safety" section — lexical scope alone is not enough).
+`NxPy.from_python_owned/3`. Its returned tuple keeps the original buffer owner
+alive while the reconstructed tensor is used.
 
 ```elixir
-input_tensor = Nx.iota({5}, type: {:s, 32}) |> Nx.backend_transfer(EXLA.Backend)
+input_tensor = Nx.iota({5}, type: {:s, 32}, backend: EXLA.Backend)
 
 {result, _} =
   Pythonx.eval(
@@ -88,25 +87,23 @@ input_tensor = Nx.iota({5}, type: {:s, 32}) |> Nx.backend_transfer(EXLA.Backend)
     %{"tensor" => input_tensor}
   )
 
-result_tensor = NxPy.from_python(result, backend: EXLA.Backend)
+owned = NxPy.from_python_owned(result, input_tensor, backend: EXLA.Backend)
+result_tensor = elem(owned, 0)
 
 IO.puts("Input:  #{inspect(Nx.to_flat_list(input_tensor))}")
 IO.puts("Output: #{inspect(Nx.to_flat_list(result_tensor))}")
 IO.puts("Expected: #{inspect(Nx.to_flat_list(Nx.multiply(Nx.iota({5}, type: {:s, 32}), 10)))}")
 IO.puts("Correct: #{Nx.to_flat_list(result_tensor) == Nx.to_flat_list(Nx.multiply(Nx.iota({5}, type: {:s, 32}), 10))}")
 
-# `input_tensor` must stay referenced until every read of `result_tensor`
-# above has completed — merely being lexically in scope is not enough, since
-# the BEAM can otherwise collect its DeviceBuffer early (see README's "GC
-# safety" section).
-send(self(), {:keep_alive, input_tensor})
+# Retain the owner tuple while `result_tensor` is needed.
+elem(owned, 1)
 ```
 
 ## EXLA Zero-Copy with Separate Output Tensor
 
 Pass an input tensor and a pre-allocated output tensor as two globals; Python
 writes `out.array[:] = in.array * 10`; reconstruct the output via
-`from_python/2`. Demonstrates preserving the input.
+`from_python_owned/3`. Demonstrates preserving the input.
 
 ```elixir
 input_tensor = Nx.iota({1_000_000}, type: {:f, 32}) |> Nx.backend_transfer(EXLA.Backend)
@@ -123,7 +120,9 @@ output_tensor = Nx.broadcast(Nx.tensor(0.0, type: {:f, 32}), {1_000_000}) |> Nx.
     %{"input" => input_tensor, "output" => output_tensor}
   )
 
-result_tensor = NxPy.from_python(result, backend: EXLA.Backend)
+owned = NxPy.from_python_owned(result, output_tensor, backend: EXLA.Backend)
+
+result_tensor = elem(owned, 0)
 expected = Nx.multiply(Nx.iota({1_000_000}, type: {:f, 32}), 10.0)
 
 IO.puts("First 10 result:   #{inspect(Nx.to_flat_list(result_tensor |> Nx.slice_along_axis(0, 10)))}")
@@ -131,9 +130,8 @@ IO.puts("First 10 expected: #{inspect(Nx.to_flat_list(expected |> Nx.slice_along
 IO.puts("Correct: #{Nx.to_flat_list(result_tensor) == Nx.to_flat_list(expected)}")
 IO.puts("Input preserved: #{Nx.to_flat_list(input_tensor |> Nx.slice_along_axis(0, 5)) == [0.0, 1.0, 2.0, 3.0, 4.0]}")
 
-# Keep both source tensors alive until every read of `result_tensor` above
-# has completed (see README's "GC safety" section).
-send(self(), {:keep_alive, {input_tensor, output_tensor}})
+# Retain the output owner while `result_tensor` is needed.
+elem(owned, 1)
 ```
 
 ## Type Coverage
@@ -258,16 +256,19 @@ s0 = Mem.snapshot()
 {result, _} =
   Pythonx.eval(
     """
+    import numpy as np
     in_arr = input.array
     out_arr = output.array
-    out_arr[:] = in_arr * 10
+    np.multiply(in_arr, 10, out=out_arr)
     output
     """,
     %{"input" => input_tensor, "output" => output_tensor}
   )
 
 s1 = Mem.snapshot()
-result_tensor = NxPy.from_python(result, backend: EXLA.Backend)
+owned = NxPy.from_python_owned(result, output_tensor, backend: EXLA.Backend)
+
+result_tensor = elem(owned, 0)
 
 IO.puts("Proof B: EXLA Backend (zero-copy)")
 Mem.print_delta("Pythonx eval", Mem.delta(s0, s1))
@@ -276,16 +277,13 @@ IO.puts("")
 IO.puts("  Expected: RSS ~0 — no data copied at any boundary.")
 IO.puts("  Contrast with Proof A where Pythonx eval shows significant RSS growth.")
 
-# Critical here: `Mem.snapshot/0` calls `:erlang.garbage_collect()` directly,
-# which makes the BEAM GC hazard far more likely to trigger. Without this
-# line, `output_tensor`'s DeviceBuffer could be collected before `result_tensor`
-# (which aliases the same memory) is read above.
-send(self(), {:keep_alive, {input_tensor, output_tensor}})
+# Retain the output buffer owner through the final read above.
+elem(owned, 1)
 ```
 
 ## Copy Count Summary
 
-| Backend            | Approach                          | Copies  | Mechanism                                                            |
-| ------------------ | --------------------------------- | :-----: | -------------------------------------------------------------------- |
+| Backend            | Approach                                     | Copies  | Mechanism                                                                              |
+| ------------------ | -------------------------------------------- | :-----: | -------------------------------------------------------------------------------------- |
 | `Nx.BinaryBackend` | encoder: `to_binary` + `frombuffer().copy()` | **2-3** | Pythonx copies binary on input + `.copy()` breaks alias + `tobytes()` on `from_python` |
-| `EXLA.Backend`     | encoder: `to_pointer(:local)` + numpy view   | **0**   | Python reads/writes same physical memory as EXLA DeviceBuffer via `tensor.array`     |
+| `EXLA.Backend`     | encoder: `to_pointer(:local)` + numpy view   | **0**   | Python reads/writes same physical memory as EXLA DeviceBuffer via `tensor.array`       |

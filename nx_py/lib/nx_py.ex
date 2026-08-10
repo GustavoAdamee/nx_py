@@ -26,13 +26,10 @@ defmodule NxPy do
         %{\"tensor\" => tensor}
       )
 
-      # Python -> Elixir: reconstruct from whatever NxTensor Python hands back
-      updated = NxPy.from_python(result, backend: EXLA.Backend)
-
-      # `tensor` isn't referenced again above, so without this line the BEAM
-      # could free its DeviceBuffer before `updated` (which aliases the same
-      # memory) is read. See "GC safety" on `from_python/2` below.
-      send(self(), {:keep_alive, tensor})
+      # Reconstruct and retain the original buffer owner together.
+      owned = NxPy.from_python_owned(result, tensor, backend: EXLA.Backend)
+      updated = elem(owned, 0)
+      # Keep or return `owned` for as long as `updated` is needed.
   """
 
   @default_python_version "==3.13.*"
@@ -69,10 +66,7 @@ defmodule NxPy do
 
     dependencies = ["nx_py @ #{py_src_path}" | extra_deps]
 
-    deps_str =
-      dependencies
-      |> Enum.map(&~s(  "#{&1}"))
-      |> Enum.join(",\n")
+    deps_str = Enum.map_join(dependencies, ",\n", &~s(  "#{&1}"))
 
     """
     [project]
@@ -105,70 +99,91 @@ defmodule NxPy do
   @doc """
   Reconstructs an `Nx.Tensor` from an `nx_py.NxTensor` Python object.
 
-  Reads `.pointer`, `.dtype`, and `.shape` off the object via a single
-  `Pythonx.eval` + `Pythonx.decode/1`, then rebuilds the tensor through
-  the chosen backend.
+  Calls `NxTensor.to_nx/1` via a single `Pythonx.eval` + `Pythonx.decode/1`,
+  then rebuilds the tensor through the chosen backend.
 
   ## Options
 
-    * `:backend` — `EXLA.Backend` (zero-copy, aliases the original buffer) or
-      `Nx.BinaryBackend` (default; copy-based).
+    * `:backend` — reconstruction backend (defaults to `Nx.default_backend/0`).
+      `Nx.BinaryBackend` is copy-based; pointer-capable backends are zero-copy.
 
   `obj` does **not** need to be the same object originally sent to Python —
   any `NxTensor` instance works, since all needed metadata lives on the
   object itself.
 
-  ## GC safety (EXLA path)
+  ## GC safety (zero-copy path)
 
-  The reconstructed EXLA tensor aliases the memory of the original buffer.
+  The reconstructed tensor aliases the memory of the original buffer.
   The original tensor must outlive not just the `eval` but also any use of
   the reconstructed tensor — otherwise the reconstructed tensor reads freed
   memory. This is inherent to zero-copy aliasing.
 
-  Merely keeping the original tensor lexically in scope is **not enough**:
-  if it is never referenced again after being sent to Python, the BEAM's
-  liveness analysis can consider it dead and collect its `DeviceBuffer`
-  before the reconstructed tensor is read, even while still "in scope" of
-  the same function. The caller must add an explicit reference after the
-  last use of the reconstructed tensor, for example:
+  Merely keeping the original tensor lexically in scope is **not enough**.
+  Once it is no longer referenced, the BEAM may collect its `DeviceBuffer`:
 
-      send(self(), {:keep_alive, original_tensor})
+      def gc_example(original) do
+        reconstructed = round_trip_through_python(original)
+        # `original` is no longer referenced and may be collected from here.
+        consume(reconstructed)
+      end
+
+  Use `from_python_owned/3` and retain its returned tuple while the
+  reconstructed tensor is in use. This explicitly keeps the owner reachable.
 
   """
   def from_python(%Pythonx.Object{} = obj, opts \\ []) do
-    backend = Keyword.get(opts, :backend, Nx.BinaryBackend)
+    backend = Keyword.get(opts, :backend, Nx.default_backend())
+    backend_module = backend_module(backend)
 
-    case backend do
-      EXLA.Backend ->
-        {pointer, data_size, dtype_str, shape} = read_pointer_fields(obj)
-        type = NxPy.Dtype.from_numpy(dtype_str)
-        ptr = %Nx.Pointer{kind: :local, address: pointer, data_size: data_size}
-        Nx.from_pointer(EXLA.Backend, ptr, type, shape)
-
-      Nx.BinaryBackend ->
-        {binary, dtype_str, shape} = read_binary_fields(obj)
+    cond do
+      backend_module == Nx.BinaryBackend ->
+        {binary, dtype_str, shape} = read_fields(obj, "binary")
         type = NxPy.Dtype.from_numpy(dtype_str)
         binary |> Nx.from_binary(type) |> Nx.reshape(shape)
+
+      function_exported?(backend_module, :from_pointer, 5) ->
+        {pointer, data_size, dtype_str, shape} = read_fields(obj, "pointer")
+        type = NxPy.Dtype.from_numpy(dtype_str)
+        ptr = %Nx.Pointer{kind: :local, address: pointer, data_size: data_size}
+        Nx.from_pointer(backend, ptr, type, shape)
+
+      true ->
+        raise ArgumentError,
+              "backend #{inspect(backend)} cannot reconstruct a tensor from a pointer"
     end
   end
 
-  defp read_pointer_fields(obj) do
+  @doc """
+  Reconstructs a tensor and returns it together with its buffer owner.
+
+  This is the safe convenience API for zero-copy reconstruction. Keep the
+  returned `{tensor, owner}` tuple intact for as long as the reconstructed
+  tensor is used. Do not immediately discard the owner by destructuring it.
+
+  ## Example
+
+      owned = NxPy.from_python_owned(obj, original, backend: EXLA.Backend)
+      reconstructed = elem(owned, 0)
+      consume(reconstructed)
+      owned
+
+  Returning or storing `owned` keeps `original` reachable. It can also be
+  stored directly in `GenServer` state.
+  """
+  def from_python_owned(%Pythonx.Object{} = obj, owner, opts \\ []) do
+    {from_python(obj, opts), owner}
+  end
+
+  defp read_fields(obj, mode) do
     {result, %{}} =
       Pythonx.eval(
-        "(obj.pointer, obj.array.nbytes, obj.dtype, tuple(obj.shape))",
-        %{"obj" => obj}
+        "obj.to_nx(mode.decode())",
+        %{"obj" => obj, "mode" => mode}
       )
 
     Pythonx.decode(result)
   end
 
-  defp read_binary_fields(obj) do
-    {result, %{}} =
-      Pythonx.eval(
-        "(obj.array.tobytes(), obj.dtype, tuple(obj.shape))",
-        %{"obj" => obj}
-      )
-
-    Pythonx.decode(result)
-  end
+  defp backend_module({backend, _opts}), do: backend
+  defp backend_module(backend), do: backend
 end

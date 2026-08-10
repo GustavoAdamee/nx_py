@@ -4,14 +4,14 @@ defmodule NxPy.Encoder do
   a `nx_py.NxTensor` Python instance.
 
   The `defimpl Pythonx.Encoder, for: Nx.Tensor` (in this same file) dispatches
-  to `encode_exla/1` or `encode_binary/1` based on the concrete backend struct
-  found at `tensor.data`. Other backends raise a clear `Protocol.UndefinedError`.
+  to `encode_pointer/1` for pointer-capable backends or `encode_binary/1` for
+  `Nx.BinaryBackend`. Other backends raise a clear `Protocol.UndefinedError`.
   """
 
   alias NxPy.Dtype
 
   @doc """
-  Zero-copy encode for `EXLA.Backend`.
+  Zero-copy encode for backends that support `Nx.to_pointer/2`.
 
   Sub-byte integers (`{:s,4}`, `{:s,2}`, `{:u,4}`, `{:u,2}`) are widened to
   8-bit first (EXLA packs sub-byte values; NumPy/ml_dtypes stores them unpacked
@@ -20,7 +20,7 @@ defmodule NxPy.Encoder do
   `ctypes`/`frombuffer` and wraps it in `nx_py.NxTensor`. Mutations in Python
   are visible on the DeviceBuffer — zero copies.
   """
-  def encode_exla(tensor) do
+  def encode_pointer(tensor) do
     {tensor, _original_type} = maybe_widen(tensor)
     ptr = Nx.to_pointer(tensor, mode: :local)
     address = ptr.address
@@ -54,7 +54,7 @@ defmodule NxPy.Encoder do
   Copy-based encode for `Nx.BinaryBackend`.
 
   Sub-byte integers (`{:s,4}`, `{:s,2}`, `{:u,4}`, `{:u,2}`) are widened to
-  8-bit first, same as `encode_exla/1` — `Nx.to_binary/1` packs sub-byte
+  8-bit first, same as `encode_pointer/1` — `Nx.to_binary/1` packs sub-byte
   values 2-per-byte, but NumPy/ml_dtypes' unpacked `int4`/`int2` dtypes
   expect 1 byte per element, so an un-widened sub-byte tensor would hand
   `frombuffer` half the bytes it needs to fill `shape`.
@@ -62,9 +62,9 @@ defmodule NxPy.Encoder do
   `Nx.to_binary/1` produces bytes; `Pythonx.eval` builds a NumPy array via
   `frombuffer(...).copy()` (the `.copy()` breaks the alias with the BEAM-owned
   binary so Python owns its own buffer), reshapes it to the tensor's shape,
-  and wraps it in `nx_py.NxTensor`. The reshape matters: `from_python/2`
-  reads shape back off `obj.shape`, so a flat `frombuffer` result would
-  round-trip a `{2, 3}` tensor back as `{6}`.
+  and wraps it in `nx_py.NxTensor`. The reshape matters: reconstruction
+  reads shape back through `NxTensor.to_nx/1`, so a flat `frombuffer` result
+  would round-trip a `{2, 3}` tensor back as `{6}`.
   """
   def encode_binary(tensor) do
     {tensor, _original_type} = maybe_widen(tensor)
@@ -108,8 +108,8 @@ defimpl Pythonx.Encoder, for: Nx.Tensor do
 
   Dispatches on the concrete backend struct at `tensor.data`:
 
-    * `%EXLA.Backend{}`     -> `NxPy.Encoder.encode_exla/1` (zero-copy)
-    * `%Nx.BinaryBackend{}` -> `NxPy.Encoder.encode_binary/1` (copy-based)
+    * Pointer-capable backends -> `NxPy.Encoder.encode_pointer/1` (zero-copy)
+    * `Nx.BinaryBackend` -> `NxPy.Encoder.encode_binary/1` (copy-based)
 
   Other backends raise a `Protocol.UndefinedError` naming the offending struct.
 
@@ -119,22 +119,23 @@ defimpl Pythonx.Encoder, for: Nx.Tensor do
   """
 
   def encode(tensor, _encoder) do
-    case tensor.data do
-      %EXLA.Backend{} ->
-        NxPy.Encoder.encode_exla(tensor)
+    backend = tensor.data.__struct__
 
-      %Nx.BinaryBackend{} ->
+    cond do
+      backend == Nx.BinaryBackend ->
         NxPy.Encoder.encode_binary(tensor)
 
-      other ->
+      function_exported?(backend, :to_pointer, 2) ->
+        NxPy.Encoder.encode_pointer(tensor)
+
+      true ->
         raise Protocol.UndefinedError,
           protocol: @protocol,
           value: tensor,
           description:
-            "nx_py does not support the #{inspect(other.__struct__)} backend yet. " <>
-              "If you intended to use a supported backend, ensure the tensor is on " <>
-              "EXLA.Backend or Nx.BinaryBackend. If Python is not initialized, call " <>
-              "NxPy.init_python/0 first."
+            "nx_py does not support the #{inspect(backend)} backend yet. " <>
+              "Use Nx.BinaryBackend or a backend with pointer support. " <>
+              "If Python is not initialized, call NxPy.init_python/0 first."
     end
   rescue
     e in Pythonx.Error ->
