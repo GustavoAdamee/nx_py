@@ -73,11 +73,10 @@ input_tensor = Nx.iota({5}, type: {:s, 32}) |> Nx.backend_transfer(EXLA.Backend)
     %{"tensor" => input_tensor}
   )
 
-owned = NxPy.from_python_owned(result, input_tensor, backend: EXLA.Backend)
-result_tensor = elem(owned, 0)
+result_tensor = NxPy.from_python(result, backend: EXLA.Backend)
 Assert.assert!("exla in-place round-trip correct", Nx.to_flat_list(result_tensor) == [0, 10, 20, 30, 40])
 
-Assert.assert!("owner retained", elem(owned, 1) == input_tensor)
+Assert.assert!("owner retained", Nx.to_flat_list(input_tensor) == [0, 10, 20, 30, 40])
 
 IO.puts("")
 
@@ -99,13 +98,11 @@ output_tensor = Nx.broadcast(Nx.tensor(0.0, type: {:f, 32}), {1000}) |> Nx.backe
     %{"input" => input_tensor, "output" => output_tensor}
   )
 
-owned = NxPy.from_python_owned(result, output_tensor, backend: EXLA.Backend)
-
-result_tensor = elem(owned, 0)
+result_tensor = NxPy.from_python(result, backend: EXLA.Backend)
 expected = Nx.multiply(Nx.iota({1000}, type: {:f, 32}), 10.0)
 Assert.assert!("exla separate output correct", Nx.to_flat_list(result_tensor) == Nx.to_flat_list(expected))
 
-Assert.assert!("output owner retained", elem(owned, 1) == output_tensor)
+Assert.assert!("output owner retained", Nx.to_flat_list(output_tensor) == Nx.to_flat_list(expected))
 
 IO.puts("")
 
@@ -285,14 +282,13 @@ s0 = Mem.snapshot()
   )
 
 s1 = Mem.snapshot()
-zc_owned = NxPy.from_python_owned(result, zc_output, backend: EXLA.Backend)
-zc_result = elem(zc_owned, 0)
+zc_result = NxPy.from_python(result, backend: EXLA.Backend)
 zero_copy_eval_rss = Mem.delta(s0, s1).rss_kb
 
 Mem.print_delta("Pythonx eval", Mem.delta(s0, s1))
 Assert.assert!("zero-copy round-trip correct", Nx.to_flat_list(zc_result |> Nx.slice_along_axis(0, 5)) == [0.0, 10.0, 20.0, 30.0, 40.0])
 
-Assert.assert!("zero-copy output owner retained", elem(zc_owned, 1) == zc_output)
+Assert.assert!("zero-copy output owner retained", Nx.to_flat_list(zc_output |> Nx.slice_along_axis(0, 5)) == [0.0, 10.0, 20.0, 30.0, 40.0])
 
 IO.puts("")
 

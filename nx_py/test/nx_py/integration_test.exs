@@ -54,16 +54,16 @@ defmodule NxPy.IntegrationTest do
   end
 
   describe "Pythonx.Encoder for Nx.Tensor — EXLA backend (zero-copy, in-place)" do
-    test "from_python_owned/3 retains the zero-copy buffer owner across garbage collection" do
+    test "referencing the owner after reconstruction keeps its buffer alive" do
       original = Nx.iota({5}, type: {:s, 32}) |> Nx.backend_transfer(EXLA.Backend)
 
       {result, _} = Pythonx.eval("tensor", %{"tensor" => original})
-      owned = NxPy.from_python_owned(result, original, backend: EXLA.Backend)
+      reconstructed = NxPy.from_python(result, backend: EXLA.Backend)
 
       :erlang.garbage_collect()
 
-      assert Nx.to_flat_list(elem(owned, 0)) == [0, 1, 2, 3, 4]
-      assert elem(owned, 1) == original
+      assert Nx.to_flat_list(reconstructed) == [0, 1, 2, 3, 4]
+      assert Nx.to_flat_list(original) == [0, 1, 2, 3, 4]
     end
 
     test "in-place mutation of tensor.array writes into the DeviceBuffer" do
@@ -79,12 +79,11 @@ defmodule NxPy.IntegrationTest do
           %{"tensor" => tensor}
         )
 
-      owned = NxPy.from_python_owned(result, tensor, backend: EXLA.Backend)
-      reconstructed = elem(owned, 0)
+      reconstructed = NxPy.from_python(result, backend: EXLA.Backend)
 
       assert Nx.to_flat_list(reconstructed) == [0, 10, 20, 30, 40]
 
-      assert elem(owned, 1) == tensor
+      assert Nx.to_flat_list(tensor) == [0, 10, 20, 30, 40]
     end
 
     test "separate output tensor preserves the input" do
@@ -104,9 +103,7 @@ defmodule NxPy.IntegrationTest do
           %{"input" => input_tensor, "output" => output_tensor}
         )
 
-      owned = NxPy.from_python_owned(result, output_tensor, backend: EXLA.Backend)
-
-      reconstructed = elem(owned, 0)
+      reconstructed = NxPy.from_python(result, backend: EXLA.Backend)
       expected = Nx.multiply(Nx.iota({1000}, type: {:f, 32}), 10.0)
 
       assert Nx.to_flat_list(reconstructed |> Nx.slice_along_axis(0, 5)) == [
@@ -128,7 +125,7 @@ defmodule NxPy.IntegrationTest do
                4.0
              ]
 
-      assert elem(owned, 1) == output_tensor
+      assert Nx.to_flat_list(output_tensor) == Nx.to_flat_list(expected)
     end
   end
 

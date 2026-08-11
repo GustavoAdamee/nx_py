@@ -19,7 +19,7 @@ Pythonx.Encoder for Nx.Tensor  ──►  NxPy.Encoder.encode_pointer/1 (zero-co
                           nx_py.NxTensor (Python object wrapping a numpy array)
                                     │
                                     ▼  (returned from Pythonx.eval)
-                    NxPy.from_python_owned/3 ──►  {Nx tensor, buffer owner}
+                       NxPy.from_python/2 ──►  Nx tensor
 ```
 
 Backends are dispatched by inspecting `tensor.data`:
@@ -50,10 +50,12 @@ tensor = Nx.iota({5}, type: {:s, 32}, backend: EXLA.Backend)
   %{"tensor" => tensor}
 )
 
-# Reconstruct and retain the original buffer owner together
-owned = NxPy.from_python_owned(result, tensor, backend: EXLA.Backend)
-updated = elem(owned, 0)
-# Keep or return `owned` for as long as `updated` is needed.
+updated = NxPy.from_python(result, backend: EXLA.Backend)
+values = Nx.to_flat_list(updated)
+
+# Returning or otherwise referencing `tensor` after the last use of `updated`
+# keeps its DeviceBuffer alive throughout the operation.
+{values, tensor}
 ```
 
 No `NxPy.configure/1` call, no `:type`/`:shape` opts — reconstruction reads shape/dtype from the returned `NxTensor`. `backend:` selects the reconstruction path and defaults to `Nx.default_backend/0`.
@@ -100,7 +102,7 @@ Sub-byte integers (`{:s, 2}`, `{:s, 4}`, `{:u, 2}`, `{:u, 4}`) are widened to 8-
 - The original Elixir `tensor` variable must stay in scope for the duration of the `Pythonx.eval` call that encodes it (normal Elixir variable scoping across the call achieves this — no extra bookkeeping needed).
 - The reconstructed tensor aliases the memory of the original buffer. The original tensor must outlive not just the `eval` but also any use of the reconstructed tensor — otherwise the reconstructed tensor reads freed memory. This is inherent to zero-copy aliasing and is called out in the `from_python/2` docs.
 - **Merely being lexically in scope is not enough.** Once the original tensor is no longer referenced, the BEAM may collect its `DeviceBuffer` before the reconstructed tensor is read.
-- Use `NxPy.from_python_owned/3` and keep its `{reconstructed, owner}` tuple intact while the reconstructed tensor is needed. Return it from a regular function or store it directly in `GenServer` state. This makes ownership explicit without relying on mailbox messages or the process dictionary.
+- Reference the original tensor after the last use of the reconstructed tensor. For example, return it together with the consumed result from a regular function, or retain it in `GenServer` state.
 - **Known limitation (sub-byte EXLA widening):** for `{:s,4}`/`{:s,2}`/`{:u,4}`/`{:u,2}` on `EXLA.Backend`, the encoder allocates a *transient* widened `DeviceBuffer` and the NumPy view wraps that transient buffer. Because the encoder returns only a `Pythonx.Object` (no Elixir-side handle survives), that widened buffer has no BEAM reference and may be collected before the caller's `eval` body runs — a use-after-free window. This refactor **does not fix this**; non-sub-byte EXLA types are unaffected. A future revision could copy sub-byte types like the Binary path, or thread a retained handle through.
 
 ## Installation

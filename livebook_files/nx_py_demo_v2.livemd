@@ -71,8 +71,8 @@ IO.puts("Correct: #{Nx.to_flat_list(result_tensor) == Nx.to_flat_list(Nx.multipl
 
 EXLA tensor passed as a global; Python mutates `tensor.array` in place
 (`arr *= 10`, writing straight into the `DeviceBuffer`); reconstruct with
-`NxPy.from_python_owned/3`. Its returned tuple keeps the original buffer owner
-alive while the reconstructed tensor is used.
+`NxPy.from_python/2`. Referencing the original tensor after the reconstructed
+tensor's final use keeps its buffer alive throughout the operation.
 
 ```elixir
 input_tensor = Nx.iota({5}, type: {:s, 32}, backend: EXLA.Backend)
@@ -87,23 +87,22 @@ input_tensor = Nx.iota({5}, type: {:s, 32}, backend: EXLA.Backend)
     %{"tensor" => input_tensor}
   )
 
-owned = NxPy.from_python_owned(result, input_tensor, backend: EXLA.Backend)
-result_tensor = elem(owned, 0)
+result_tensor = NxPy.from_python(result, backend: EXLA.Backend)
 
 IO.puts("Input:  #{inspect(Nx.to_flat_list(input_tensor))}")
 IO.puts("Output: #{inspect(Nx.to_flat_list(result_tensor))}")
 IO.puts("Expected: #{inspect(Nx.to_flat_list(Nx.multiply(Nx.iota({5}, type: {:s, 32}), 10)))}")
 IO.puts("Correct: #{Nx.to_flat_list(result_tensor) == Nx.to_flat_list(Nx.multiply(Nx.iota({5}, type: {:s, 32}), 10))}")
 
-# Retain the owner tuple while `result_tensor` is needed.
-elem(owned, 1)
+# Keep the owner live through the final use of `result_tensor`.
+input_tensor
 ```
 
 ## EXLA Zero-Copy with Separate Output Tensor
 
 Pass an input tensor and a pre-allocated output tensor as two globals; Python
 writes `out.array[:] = in.array * 10`; reconstruct the output via
-`from_python_owned/3`. Demonstrates preserving the input.
+`from_python/2`. Demonstrates preserving the input.
 
 ```elixir
 input_tensor = Nx.iota({1_000_000}, type: {:f, 32}) |> Nx.backend_transfer(EXLA.Backend)
@@ -120,9 +119,7 @@ output_tensor = Nx.broadcast(Nx.tensor(0.0, type: {:f, 32}), {1_000_000}) |> Nx.
     %{"input" => input_tensor, "output" => output_tensor}
   )
 
-owned = NxPy.from_python_owned(result, output_tensor, backend: EXLA.Backend)
-
-result_tensor = elem(owned, 0)
+result_tensor = NxPy.from_python(result, backend: EXLA.Backend)
 expected = Nx.multiply(Nx.iota({1_000_000}, type: {:f, 32}), 10.0)
 
 IO.puts("First 10 result:   #{inspect(Nx.to_flat_list(result_tensor |> Nx.slice_along_axis(0, 10)))}")
@@ -130,8 +127,8 @@ IO.puts("First 10 expected: #{inspect(Nx.to_flat_list(expected |> Nx.slice_along
 IO.puts("Correct: #{Nx.to_flat_list(result_tensor) == Nx.to_flat_list(expected)}")
 IO.puts("Input preserved: #{Nx.to_flat_list(input_tensor |> Nx.slice_along_axis(0, 5)) == [0.0, 1.0, 2.0, 3.0, 4.0]}")
 
-# Retain the output owner while `result_tensor` is needed.
-elem(owned, 1)
+# Keep the output owner live through the final use of `result_tensor`.
+output_tensor
 ```
 
 ## Type Coverage
@@ -266,9 +263,7 @@ s0 = Mem.snapshot()
   )
 
 s1 = Mem.snapshot()
-owned = NxPy.from_python_owned(result, output_tensor, backend: EXLA.Backend)
-
-result_tensor = elem(owned, 0)
+result_tensor = NxPy.from_python(result, backend: EXLA.Backend)
 
 IO.puts("Proof B: EXLA Backend (zero-copy)")
 Mem.print_delta("Pythonx eval", Mem.delta(s0, s1))
@@ -278,7 +273,7 @@ IO.puts("  Expected: RSS ~0 — no data copied at any boundary.")
 IO.puts("  Contrast with Proof A where Pythonx eval shows significant RSS growth.")
 
 # Retain the output buffer owner through the final read above.
-elem(owned, 1)
+output_tensor
 ```
 
 ## Copy Count Summary

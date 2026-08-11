@@ -26,10 +26,12 @@ defmodule NxPy do
         %{\"tensor\" => tensor}
       )
 
-      # Reconstruct and retain the original buffer owner together.
-      owned = NxPy.from_python_owned(result, tensor, backend: EXLA.Backend)
-      updated = elem(owned, 0)
-      # Keep or return `owned` for as long as `updated` is needed.
+      updated = NxPy.from_python(result, backend: EXLA.Backend)
+      consume(updated)
+
+      # Referencing or returning `tensor` after the last use of `updated`
+      # keeps its DeviceBuffer alive for the whole operation.
+      {updated, tensor}
   """
 
   @default_python_version "==3.13.*"
@@ -127,8 +129,15 @@ defmodule NxPy do
         consume(reconstructed)
       end
 
-  Use `from_python_owned/3` and retain its returned tuple while the
-  reconstructed tensor is in use. This explicitly keeps the owner reachable.
+  Reference the original after the last use of the reconstructed tensor. For
+  example, returning both values keeps the original reachable for the whole
+  operation:
+
+      def gc_safe_example(original) do
+        reconstructed = round_trip_through_python(original)
+        result = consume(reconstructed)
+        {result, original}
+      end
 
   """
   def from_python(%Pythonx.Object{} = obj, opts \\ []) do
@@ -151,27 +160,6 @@ defmodule NxPy do
         raise ArgumentError,
               "backend #{inspect(backend)} cannot reconstruct a tensor from a pointer"
     end
-  end
-
-  @doc """
-  Reconstructs a tensor and returns it together with its buffer owner.
-
-  This is the safe convenience API for zero-copy reconstruction. Keep the
-  returned `{tensor, owner}` tuple intact for as long as the reconstructed
-  tensor is used. Do not immediately discard the owner by destructuring it.
-
-  ## Example
-
-      owned = NxPy.from_python_owned(obj, original, backend: EXLA.Backend)
-      reconstructed = elem(owned, 0)
-      consume(reconstructed)
-      owned
-
-  Returning or storing `owned` keeps `original` reachable. It can also be
-  stored directly in `GenServer` state.
-  """
-  def from_python_owned(%Pythonx.Object{} = obj, owner, opts \\ []) do
-    {from_python(obj, opts), owner}
   end
 
   defp read_fields(obj, mode) do
