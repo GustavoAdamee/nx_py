@@ -135,8 +135,9 @@ mix test test/nx_py_test.exs test/nx_py/dtype_test.exs test/nx_py/encoder_test.e
 # Full suite (integration test needs network for uv + numpy + ml-dtypes + bundled nx_py):
 mix test
 
-# Standalone integration script (also needs network):
-elixir nx_py/test_integration.exs
+# Standalone integration + memory-proof script (also needs network).
+# Run from the repository root:
+elixir livebook_files/nx_py_integration_proof.exs
 ```
 
 Test files mirror `lib/`:
