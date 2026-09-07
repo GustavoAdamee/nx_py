@@ -1,13 +1,16 @@
-# nx_py Integration Test Script
+# nx_py Integration Test Script (protocol/encoder-based)
 #
 # Run from the TCC root directory:
 #   cd /Users/gdomingues/Documents/UTFPR/TCC && elixir nx_py/test_integration.exs
 #
-# This script tests the full round-trip with Pythonx:
+# This script tests the full round-trip with Pythonx using the new
+# Pythonx.Encoder for Nx.Tensor dispatch + NxPy.from_python/2:
 # 1. Binary backend (copy-based)
-# 2. EXLA backend (zero-copy)
-# 3. Type coverage
-# 4. ml_dtypes round-trip
+# 2. EXLA backend (zero-copy, in-place)
+# 3. EXLA backend (zero-copy, separate output)
+# 4. Type coverage (encode each type, read .dtype/.shape back via Pythonx)
+# 5. ml_dtypes round-trip (bf16, f8_e5m2)
+# 6. Memory proofs (RSS)
 
 Mix.install([
   {:nx_py, path: __DIR__},
@@ -19,60 +22,38 @@ Mix.install([
 # Force EXLA as default backend
 Application.put_env(:nx, :default_backend, {EXLA.Backend, client: :host})
 
-# Init Python environment
-Pythonx.uv_init("""
-[project]
-name = "project"
-version = "0.0.0"
-requires-python = "==3.13.*"
-dependencies = [
-  "numpy==2.2.2",
-  "ml-dtypes==0.5.0"
-]
-""")
+# Init Python environment (installs numpy, ml-dtypes, and the bundled nx_py
+# package that defines NxTensor)
+NxPy.init_python()
 
 IO.puts("\n========================================")
-IO.puts("  nx_py Integration Test")
+IO.puts("  nx_py Integration Test (encoder-based)")
 IO.puts("========================================\n")
-
-{passed, failed} = {0, 0}
 
 defmodule Assert do
   def assert!(label, true), do: IO.puts("  PASS: #{label}")
   def assert!(label, false), do: raise("FAIL: #{label}")
 end
 
-# ── Binary Backend ──────────────────────────────────────────────
+# ── Binary Backend (copy-based) ────────────────────────────────
 
 IO.puts("── Binary Backend (copy-based) ──")
 
-NxPy.configure(backend: NxPy.Backend.Binary, python_lib: NxPy.PythonLib.Numpy)
-
 tensor = Nx.iota({5}, type: {:s, 32})
-ref = NxPy.to_python(tensor)
 
-Assert.assert!("ref.mode == :copy_based", ref.mode == :copy_based)
-Assert.assert!("ref.pointer == nil", ref.pointer == nil)
-Assert.assert!("ref.data is binary", is_binary(ref.data))
-Assert.assert!("ref.dtype == \"int32\"", ref.dtype == "int32")
-Assert.assert!("ref.shape == [5]", ref.shape == [5])
+{result, _} =
+  Pythonx.eval(
+    """
+    arr = tensor.array
+    out = arr * 10
+    from nx_py import NxTensor
+    NxTensor(out)
+    """,
+    %{"tensor" => tensor}
+  )
 
-# Python round-trip
-{py_result, _} = Pythonx.eval(
-  """
-  import numpy as np
-  arr = np.frombuffer(data, dtype='#{ref.dtype}').reshape(#{inspect(ref.shape)})
-  result = arr * 10
-  result.tobytes()
-  """,
-  %{"data" => ref.data}
-)
-
-result_bytes = Pythonx.decode(py_result)
-ref = %{ref | data: result_bytes}
-result = NxPy.from_python(ref, type: {:s, 32}, shape: {5})
-
-Assert.assert!("binary round-trip correct", Nx.to_flat_list(result) == [0, 10, 20, 30, 40])
+result_tensor = NxPy.from_python(result, backend: Nx.BinaryBackend)
+Assert.assert!("binary round-trip correct", Nx.to_flat_list(result_tensor) == [0, 10, 20, 30, 40])
 
 IO.puts("")
 
@@ -80,29 +61,22 @@ IO.puts("")
 
 IO.puts("── EXLA Backend (zero-copy, in-place) ──")
 
-NxPy.configure(backend: NxPy.Backend.EXLA, python_lib: NxPy.PythonLib.Numpy)
+input_tensor = Nx.iota({5}, type: {:s, 32}) |> Nx.backend_transfer(EXLA.Backend)
 
-input_tensor = Nx.iota({5}, type: {:s, 32})
-ref = NxPy.to_python(input_tensor)
+{result, _} =
+  Pythonx.eval(
+    """
+    arr = tensor.array
+    arr *= 10
+    tensor
+    """,
+    %{"tensor" => input_tensor}
+  )
 
-Assert.assert!("ref.mode == :zero_copy", ref.mode == :zero_copy)
-Assert.assert!("ref.pointer is integer", is_integer(ref.pointer) and ref.pointer > 0)
-Assert.assert!("ref.data == nil", ref.data == nil)
-Assert.assert!("ref.dtype == \"int32\"", ref.dtype == "int32")
+result_tensor = NxPy.from_python(result, backend: EXLA.Backend)
+Assert.assert!("exla in-place round-trip correct", Nx.to_flat_list(result_tensor) == [0, 10, 20, 30, 40])
 
-# Python writes in-place via ctypes
-{_, _} = Pythonx.eval(
-  """
-  import ctypes, numpy as np
-  buf = (ctypes.c_uint8 * #{ref.data_size}).from_address(#{ref.pointer})
-  arr = np.frombuffer(buf, dtype='#{ref.dtype}').reshape(#{inspect(ref.shape)})
-  np.copyto(arr, arr * 10)
-  """,
-  %{}
-)
-
-result = NxPy.from_python(ref, type: {:s, 32}, shape: {5})
-Assert.assert!("exla in-place round-trip correct", Nx.to_flat_list(result) == [0, 10, 20, 30, 40])
+Assert.assert!("owner retained", Nx.to_flat_list(input_tensor) == [0, 10, 20, 30, 40])
 
 IO.puts("")
 
@@ -110,33 +84,31 @@ IO.puts("")
 
 IO.puts("── EXLA Backend (zero-copy, separate output) ──")
 
-input_tensor = Nx.iota({1000}, type: {:f, 32})
-input_ref = NxPy.to_python(input_tensor)
+input_tensor = Nx.iota({1000}, type: {:f, 32}) |> Nx.backend_transfer(EXLA.Backend)
+output_tensor = Nx.broadcast(Nx.tensor(0.0, type: {:f, 32}), {1000}) |> Nx.backend_transfer(EXLA.Backend)
 
-output_tensor = Nx.broadcast(Nx.tensor(0.0, type: {:f, 32}), {1000})
-output_ref = NxPy.to_python(output_tensor)
+{result, _} =
+  Pythonx.eval(
+    """
+    in_arr = input.array
+    out_arr = output.array
+    out_arr[:] = in_arr * 10
+    output
+    """,
+    %{"input" => input_tensor, "output" => output_tensor}
+  )
 
-{_, _} = Pythonx.eval(
-  """
-  import ctypes, numpy as np
-  in_buf = (ctypes.c_uint8 * #{input_ref.data_size}).from_address(#{input_ref.pointer})
-  in_arr = np.frombuffer(in_buf, dtype='#{input_ref.dtype}')
-  out_buf = (ctypes.c_uint8 * #{output_ref.data_size}).from_address(#{output_ref.pointer})
-  out_arr = np.frombuffer(out_buf, dtype='#{output_ref.dtype}')
-  out_arr[:] = in_arr * 10
-  """,
-  %{}
-)
+result_tensor = NxPy.from_python(result, backend: EXLA.Backend)
+expected = Nx.multiply(Nx.iota({1000}, type: {:f, 32}), 10.0)
+Assert.assert!("exla separate output correct", Nx.to_flat_list(result_tensor) == Nx.to_flat_list(expected))
 
-result = NxPy.from_python(output_ref, type: {:f, 32}, shape: {1000})
-expected = Nx.multiply(Nx.iota({1000}, type: {:f, 32}), 10)
-Assert.assert!("exla separate output correct", Nx.to_flat_list(result) == Nx.to_flat_list(expected))
+Assert.assert!("output owner retained", Nx.to_flat_list(output_tensor) == Nx.to_flat_list(expected))
 
 IO.puts("")
 
-# ── Type Coverage ──────────────────────────────────────────────
+# ── Type Coverage (encode each type, read .dtype/.shape back) ──
 
-IO.puts("── Type Coverage (to_python only) ──")
+IO.puts("── Type Coverage ──")
 
 types_to_test = [
   {:f, 64}, {:f, 32}, {:f, 16},
@@ -146,30 +118,35 @@ types_to_test = [
   {:c, 64}, {:c, 128}
 ]
 
-NxPy.configure(backend: NxPy.Backend.EXLA, python_lib: NxPy.PythonLib.Numpy)
+type_results =
+  Enum.map(types_to_test, fn type ->
+    try do
+      tensor = Nx.iota({100}) |> Nx.as_type(type) |> Nx.backend_transfer(EXLA.Backend)
 
-type_results = Enum.map(types_to_test, fn type ->
-  try do
-    tensor = Nx.iota({100}) |> Nx.as_type(type) |> Nx.backend_transfer(EXLA.Backend)
-    ref = NxPy.to_python(tensor)
+      {result, _} =
+        Pythonx.eval(
+          """
+          (obj.dtype, tuple(obj.shape))
+          """,
+          %{"obj" => tensor}
+        )
 
-    ptr_ok = is_integer(ref.pointer) and ref.pointer > 0
-    dtype_ok = is_binary(ref.dtype) and byte_size(ref.dtype) > 0
-    shape_ok = ref.shape == [100]
+      {dtype_str, shape} = Pythonx.decode(result)
+      expected_dtype = NxPy.Dtype.to_numpy(type)
 
-    if ptr_ok and dtype_ok and shape_ok do
-      IO.puts("  PASS: #{inspect(type)} → dtype=#{ref.dtype}")
-      :ok
-    else
-      IO.puts("  FAIL: #{inspect(type)} → ptr_ok=#{ptr_ok} dtype_ok=#{dtype_ok} shape_ok=#{shape_ok}")
-      :fail
+      if dtype_str == expected_dtype and shape == {100} do
+        IO.puts("  PASS: #{inspect(type)} -> dtype=#{dtype_str}, shape=#{inspect(shape)}")
+        :ok
+      else
+        IO.puts("  FAIL: #{inspect(type)} -> dtype=#{dtype_str} (expected #{expected_dtype}), shape=#{inspect(shape)}")
+        :fail
+      end
+    rescue
+      e ->
+        IO.puts("  FAIL: #{inspect(type)} -> #{Exception.message(e) |> String.slice(0, 80)}")
+        :fail
     end
-  rescue
-    e ->
-      IO.puts("  FAIL: #{inspect(type)} → #{Exception.message(e) |> String.slice(0, 80)}")
-      :fail
-  end
-end)
+  end)
 
 type_passed = Enum.count(type_results, & &1 == :ok)
 type_failed = Enum.count(type_results, & &1 == :fail)
@@ -180,33 +157,30 @@ IO.puts("")
 
 IO.puts("── Python round-trip with ml_dtypes (bf16) ──")
 
-NxPy.configure(backend: NxPy.Backend.EXLA, python_lib: NxPy.PythonLib.Numpy)
-
 bf16_tensor = Nx.tensor([1.0, 2.0, 3.0], type: {:bf, 16}) |> Nx.backend_transfer(EXLA.Backend)
-bf16_ref = NxPy.to_python(bf16_tensor)
 
-Assert.assert!("bf16 dtype == \"bfloat16\"", bf16_ref.dtype == "bfloat16")
+{result, _} =
+  Pythonx.eval(
+    """
+    arr = tensor.array
+    out = arr * 10
+    from nx_py import NxTensor
+    NxTensor(out)
+    """,
+    %{"tensor" => bf16_tensor}
+  )
 
-# For bf16 with EXLA zero-copy, Python uses ml_dtypes via ctypes
-output_tensor = Nx.broadcast(Nx.tensor(0.0, type: {:bf, 16}), {3}) |> Nx.backend_transfer(EXLA.Backend)
-output_ref = NxPy.to_python(output_tensor)
-
-{_, _} = Pythonx.eval(
-  """
-  import ctypes, numpy as np, ml_dtypes
-  in_buf = (ctypes.c_uint8 * #{bf16_ref.data_size}).from_address(#{bf16_ref.pointer})
-  in_arr = np.frombuffer(in_buf, dtype=ml_dtypes.bfloat16)
-  out_buf = (ctypes.c_uint8 * #{output_ref.data_size}).from_address(#{output_ref.pointer})
-  out_arr = np.frombuffer(out_buf, dtype=ml_dtypes.bfloat16)
-  out_arr[:] = in_arr * 10
-  """,
-  %{}
-)
-
-result = NxPy.from_python(output_ref, type: {:bf, 16}, shape: {3})
-result_list = Nx.to_flat_list(result)
+# `out` is a *fresh* NumPy array (`arr * 10` allocates new memory; it is not
+# an alias of `bf16_tensor`'s DeviceBuffer), so its pointer has no relation
+# to XLA's allocator and is not guaranteed to satisfy XLA's buffer alignment
+# requirements. Reconstructing via `backend: EXLA.Backend` here would be
+# unsound (intermittent "unaligned data" crashes depending on where Python's
+# allocator happened to place `out`). `Nx.BinaryBackend` is copy-based and
+# has no alignment requirement, so it's the correct choice whenever the
+# Python-side result isn't a genuine alias of an original EXLA buffer.
+bf16_result = NxPy.from_python(result, backend: Nx.BinaryBackend)
+result_list = Nx.to_flat_list(bf16_result)
 IO.puts("  bf16 result: #{inspect(result_list)}")
-# bf16 has low precision, just check it ran without error
 Assert.assert!("bf16 round-trip executed", length(result_list) == 3)
 
 IO.puts("")
@@ -216,27 +190,22 @@ IO.puts("")
 IO.puts("── Python round-trip with ml_dtypes (f8_e5m2) ──")
 
 f8_tensor = Nx.tensor([1.0, 2.0, 3.0, 4.0, 5.0], type: {:f, 8}) |> Nx.backend_transfer(EXLA.Backend)
-f8_ref = NxPy.to_python(f8_tensor)
 
-Assert.assert!("f8 dtype == \"float8_e5m2\"", f8_ref.dtype == "float8_e5m2")
+{result, _} =
+  Pythonx.eval(
+    """
+    arr = tensor.array
+    out = arr * 2
+    from nx_py import NxTensor
+    NxTensor(out)
+    """,
+    %{"tensor" => f8_tensor}
+  )
 
-output_tensor = Nx.broadcast(Nx.tensor(0.0, type: {:f, 8}), {5}) |> Nx.backend_transfer(EXLA.Backend)
-output_ref = NxPy.to_python(output_tensor)
-
-{_, _} = Pythonx.eval(
-  """
-  import ctypes, numpy as np, ml_dtypes
-  in_buf = (ctypes.c_uint8 * #{f8_ref.data_size}).from_address(#{f8_ref.pointer})
-  in_arr = np.frombuffer(in_buf, dtype=ml_dtypes.float8_e5m2)
-  out_buf = (ctypes.c_uint8 * #{output_ref.data_size}).from_address(#{output_ref.pointer})
-  out_arr = np.frombuffer(out_buf, dtype=ml_dtypes.float8_e5m2)
-  out_arr[:] = in_arr * 2
-  """,
-  %{}
-)
-
-result = NxPy.from_python(output_ref, type: {:f, 8}, shape: {5})
-result_list = Nx.to_flat_list(result)
+# Same reasoning as the bf16 section above: `out` is a fresh NumPy array,
+# not an alias of `f8_tensor`'s DeviceBuffer.
+f8_result = NxPy.from_python(result, backend: Nx.BinaryBackend)
+result_list = Nx.to_flat_list(f8_result)
 IO.puts("  f8 result: #{inspect(result_list)}")
 Assert.assert!("f8 round-trip executed", length(result_list) == 5)
 
@@ -269,69 +238,57 @@ end
 
 IO.puts("── Memory Proof A: Binary Backend (copy-based) ──")
 
-NxPy.configure(backend: NxPy.Backend.Binary, python_lib: NxPy.PythonLib.Numpy)
-
 s0 = Mem.snapshot()
 
 mem_tensor = Nx.iota({1_000_000}, type: {:f, 32})
-mem_ref = NxPy.to_python(mem_tensor)
+
+{result, _} =
+  Pythonx.eval(
+    """
+    arr = tensor.array
+    out = arr * 10
+    from nx_py import NxTensor
+    NxTensor(out)
+    """,
+    %{"tensor" => mem_tensor}
+  )
 s1 = Mem.snapshot()
 
-{py_result, _} = Pythonx.eval(
-  """
-  import numpy as np
-  arr = np.frombuffer(data, dtype='#{mem_ref.dtype}').reshape(#{inspect(mem_ref.shape)})
-  result = arr * 10
-  result.tobytes()
-  """,
-  %{"data" => mem_ref.data}
-)
-s2 = Mem.snapshot()
+mem_result = NxPy.from_python(result, backend: Nx.BinaryBackend)
+copy_eval_rss = Mem.delta(s0, s1).rss_kb
 
-result_bytes = Pythonx.decode(py_result)
-mem_ref = %{mem_ref | data: result_bytes}
-mem_result = NxPy.from_python(mem_ref, type: {:f, 32}, shape: {1_000_000})
-
-_copy_to_python_rss = Mem.delta(s0, s1).rss_kb
-copy_eval_rss = Mem.delta(s1, s2).rss_kb
-
-Mem.print_delta("to_python", Mem.delta(s0, s1))
-Mem.print_delta("Pythonx eval", Mem.delta(s1, s2))
+Mem.print_delta("Pythonx eval", Mem.delta(s0, s1))
 Assert.assert!("copy round-trip correct", Nx.to_flat_list(mem_result |> Nx.slice_along_axis(0, 5)) == [0.0, 10.0, 20.0, 30.0, 40.0])
 
 IO.puts("")
 
 IO.puts("── Memory Proof B: EXLA Backend (zero-copy) ──")
 
-NxPy.configure(backend: NxPy.Backend.EXLA, python_lib: NxPy.PythonLib.Numpy)
-
-zc_input = Nx.iota({1_000_000}, type: {:f, 32})
-zc_output = Nx.broadcast(Nx.tensor(0.0, type: {:f, 32}), {1_000_000})
-
-zc_input_ref = NxPy.to_python(zc_input)
-zc_output_ref = NxPy.to_python(zc_output)
+zc_input = Nx.iota({1_000_000}, type: {:f, 32}) |> Nx.backend_transfer(EXLA.Backend)
+zc_output = Nx.broadcast(Nx.tensor(0.0, type: {:f, 32}), {1_000_000}) |> Nx.backend_transfer(EXLA.Backend)
 
 s0 = Mem.snapshot()
 
-{_, _} = Pythonx.eval(
-  """
-  import ctypes, numpy as np
-  in_buf = (ctypes.c_uint8 * #{zc_input_ref.data_size}).from_address(#{zc_input_ref.pointer})
-  in_arr = np.frombuffer(in_buf, dtype='#{zc_input_ref.dtype}')
-  out_buf = (ctypes.c_uint8 * #{zc_output_ref.data_size}).from_address(#{zc_output_ref.pointer})
-  out_arr = np.frombuffer(out_buf, dtype='#{zc_output_ref.dtype}')
-  out_arr[:] = in_arr * 10
-  """,
-  %{}
-)
+{result, _} =
+  Pythonx.eval(
+    """
+    import numpy as np
+    in_arr = input.array
+    out_arr = output.array
+    np.multiply(in_arr, 10, out=out_arr)
+    output
+    """,
+    %{"input" => zc_input, "output" => zc_output}
+  )
 
 s1 = Mem.snapshot()
-zc_result = NxPy.from_python(zc_output_ref, type: {:f, 32}, shape: {1_000_000})
-
+zc_result = NxPy.from_python(result, backend: EXLA.Backend)
 zero_copy_eval_rss = Mem.delta(s0, s1).rss_kb
 
 Mem.print_delta("Pythonx eval", Mem.delta(s0, s1))
 Assert.assert!("zero-copy round-trip correct", Nx.to_flat_list(zc_result |> Nx.slice_along_axis(0, 5)) == [0.0, 10.0, 20.0, 30.0, 40.0])
+
+Assert.assert!("zero-copy output owner retained", Nx.to_flat_list(zc_output |> Nx.slice_along_axis(0, 5)) == [0.0, 10.0, 20.0, 30.0, 40.0])
 
 IO.puts("")
 
@@ -349,7 +306,8 @@ IO.puts("")
 
 # ── Summary ────────────────────────────────────────────────────
 
-total_passed = type_passed + 23  # 23 from the fixed assertions above (20 + 3 memory proofs)
+fixed_passed = 7  # binary + exla-inplace + exla-separate + bf16 + f8 + 2 memory proofs
+total_passed = type_passed + fixed_passed
 total_failed = type_failed
 
 IO.puts("========================================")
