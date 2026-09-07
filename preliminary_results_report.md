@@ -2,10 +2,11 @@
 
 ## 1. Introducao
 
-Os artefatos estao organizados em tres notebooks Livebook:
+Os artefatos estao organizados em quatro notebooks Livebook:
 - `poc.livemd` — Implementacoes do bridge (copy-based e view-based) com benchmarks
 - `type_coverage.livemd` — Matriz de validacao completa dos 16 tipos Nx
 - `benchmarks.livemd` — Benchmarks sistematicos incluindo baseline nativo Nx
+- `exla_zero_copy.livemd` — Interoperabilidade zero-copy via EXLA `to_pointer`/`from_pointer`
 
 ## 2. Implementacoes do Bridge
 
@@ -35,8 +36,9 @@ Um modulo auxiliar mapeia tipos Nx para strings de dtype NumPy. Tres estrategias
 | Estrategia | Tipos |
 |------------|-------|
 | **NumPy nativo** | `{:f, 64}`, `{:f, 32}`, `{:f, 16}`, `{:s, 8}`-`{:s, 64}`, `{:u, 8}`-`{:u, 64}`, `{:c, 64}`, `{:c, 128}` |
-| **ml_dtypes** | `{:bf, 16}`, `{:f, 8}` (E5M2), `{:f8_e4m3fn, 8}` (E4M3FN) |
-| **Nao suportado** | `{:s, 2}`, `{:s, 4}`, `{:u, 2}`, `{:u, 4}` — o usuario deve converter para um tipo mais largo antes de chamar o bridge |
+| **ml_dtypes** | `{:bf, 16}`, `{:f, 8}` (E5M2), `{:f8_e4m3fn, 8}` (E4M3FN), `{:s, 4}`, `{:s, 2}`, `{:u, 4}`, `{:u, 2}` |
+
+**Nota sobre tipos sub-byte:** `ml_dtypes` suporta `int4`/`uint4`/`int2`/`uint2`, porem utiliza representacao **unpacked** (1 byte por elemento). O EXLA empacota valores sub-byte (e.g., dois `int4` por byte). O bridge requer uma etapa de conversao pack/unpack na fronteira.
 
 ## 3. Resultados de Cobertura de Tipos
 
@@ -71,7 +73,7 @@ Tipo              Estrategia    Copy-based          View-based
 **Observacoes sobre tipos especificos:**
 - `{:f, 16}` e `{:f8_e4m3fn, 8}`: aprovados com ressalvas. f16 possui ~3,3 digitos decimais de precisao (mantissa de 10 bits); f8_e4m3fn possui ~1,2 digitos (mantissa de 3 bits, valor finito maximo de 448).
 - `{:bf, 16}` e `{:f, 8}` (E5M2): a divergencia e esperada e documentada. Reduzir os dados de teste para forcar aprovacao produziria um falso positivo — a divergencia reflete diferencas genuinas no comportamento de arredondamento entre o BinaryBackend do Nx e o ml_dtypes do NumPy.
-- Tipos sub-byte (`{:s, 2}`, `{:s, 4}`, `{:u, 2}`, `{:u, 4}`): nao suportados pelo bridge. O usuario deve converter para um tipo mais largo (e.g. `{:s, 8}`, `{:u, 8}`) antes de chamar o bridge.
+- Tipos sub-byte (`{:s, 2}`, `{:s, 4}`, `{:u, 2}`, `{:u, 4}`): suportados via `ml_dtypes` com ressalva. A representacao no NumPy e unpacked (1 byte por elemento), enquanto EXLA empacota (e.g., 2 valores `int4` por byte). O bridge requer conversao pack/unpack.
 
 ### 3.1 Validacao multidimensional
 
@@ -123,15 +125,63 @@ Ambas as abordagens (copy-based e view-based) compartilham uma limitacao fundame
 |-----------|:------------------:|:-------------------:|:-----------------:|:-----:|
 | Copy-based (`tobytes`) | 1 (Pythonx) | 1 (`tobytes()` aloca buffer) | 1 (Pythonx encode) | **3** |
 | View-based (`ndarray.view`) | 1 (Pythonx) | 0 (`view()` reinterpreta in-place) | 1 (Pythonx encode) | **2** |
-| Zero-Copy NIF (trabalho futuro) | 0 (ponteiro) | 0 | 0 (ponteiro) | **0** |
+| EXLA `to_pointer` + ctypes | 0 (ponteiro) | 0 | 0 (ponteiro) | **0** |
 
-## 6. Resumo
+## 6. Interoperabilidade Zero-Copy via EXLA
+
+Utilizando a API oficial do Nx (`Nx.to_pointer`/`Nx.from_pointer`) com o backend EXLA, e possivel compartilhar memoria diretamente entre Elixir e Python sem nenhuma copia de dados. O artefato `exla_zero_copy.livemd` contem tres provas isoladas, cada uma medindo apenas uma direcao do fluxo de dados via RSS (Resident Set Size) do processo BEAM.
+
+**Por que RSS e nao `:erlang.memory(:binary)`:** Alocacoes feitas via NIF (EXLA DeviceBuffers, Python `bytes` via `PyBytes_FromStringAndSize`) nao sao mapeadas pelo `:erlang.memory(:binary)`, tornando-o inadequado para medir copias na fronteira Elixir/Python/EXLA. O RSS do processo captura todas as alocacoes, incluindo as do lado Python.
+
+### 6.1 Resultados das provas de memoria
+
+| Direcao | Abordagem | Copias | RSS delta | Mecanismo |
+|---------|-----------|:------:|-----------|-----------|
+| Elixir → Python | `to_binary` + Pythonx | **1** | ~10-16 MB (1a exec) | `PyBytes_FromStringAndSize` copia binario Erlang em Python `bytes` |
+| Python → Elixir | Pythonx resource binary | **0** | ~0 KB | `enif_make_resource_binary` aponta binario Erlang para buffer Python |
+| EXLA → Python | `to_pointer(:local)` + ctypes | **0** | ~16 KB | `ctypes.from_address` acessa mesma memoria fisica do EXLA DeviceBuffer |
+
+O contraste entre Proof 1 (~10-16 MB RSS) e Proof 3 (~16 KB RSS) demonstra que `to_pointer(:local)` elimina completamente a copia na fronteira de entrada, que e o unico gargalo remanescente do Pythonx.
+
+### 6.2 Modelo de processo
+
+Pythonx executa CPython no mesmo processo OS que a BEAM (via NIF embutido). Isso permite o uso do modo `:local` do `to_pointer` — ponteiros sao validos no espaco de endereco compartilhado. O modo `:ipc` (shared memory POSIX) nao e necessario neste cenario.
+
+### 6.3 Validacao via LLDB + Python ctypes
+
+Para comprovar que `to_pointer(:local)` expoe o endereco fisico real do DeviceBuffer (e nao apenas uma metrica indireta via RSS), foi realizada uma prova com LLDB (debugger) e Python ctypes operando sobre o mesmo endereco de memoria.
+
+**Configuracao:** EXLA compilada com `DEBUG=1` (flag `-g`, debug symbols DWARF v5, sem `-O3`). Script standalone `lldb_zero_copy_proof.exs` executado a partir do diretorio `nx/exla/`.
+
+**Procedimento:**
+1. Tensor `[1, 2, 3, 4, 5]` (int32) criado no EXLA `:host`
+2. `Nx.to_pointer(tensor, mode: :local)` retorna endereco `0x731332B00` (20 bytes)
+3. LLDB faz attach ao processo BEAM e le memoria no endereco — conteudo correto
+4. Python escreve `99` no primeiro elemento via `ctypes.memmove` no mesmo endereco
+5. LLDB verifica a escrita no mesmo endereco — `0x63 00 00 00` (99 em little-endian)
+6. Elixir le o tensor de volta: `[99, 2, 3, 4, 5]` — sem nenhuma copia
+
+| Passo | Acao | Resultado |
+|-------|------|-----------|
+| `to_pointer` | Obter endereco do DeviceBuffer | `0x731332B00` (20 bytes) |
+| Python `ctypes.from_address` | Ler primeiro elemento | `1` (acessa mesma memoria) |
+| Python `ctypes.memmove` | Escrever `99` no primeiro int32 | Escrita direta no DeviceBuffer |
+| `Nx.to_flat_list` | Ler tensor de volta | `[99, 2, 3, 4, 5]` — modificacao visivel |
+| `Nx.from_pointer` | Segundo tensor no mesmo ponteiro | `[99, 2, 3, 4, 5]` — mesma memoria |
+
+**Conclusao:** Tres entidades independentes — EXLA (C++/XLA), Python (ctypes) e LLDB (debugger) — acessam e modificam a mesma regiao de memoria. Nenhuma copia intermediaria em qualquer direcao. Zero-copy confirmado no nivel do hardware.
+
+**Detalhes completos:** `docs/research/lldb-zero-copy-proof.md`
+
+## 7. Resumo
 
 | Objetivo | Status | Artefato |
 |----------|--------|----------|
 | Cobertura de tipos (16 tipos Nx) | Completo | `type_coverage.livemd` |
 | Integracao com pipeline Nx (`runtime_call`) | Completo | `poc.livemd` |
-| Analise de copias de memoria | Completo | `poc.livemd`, `zero_copy_nif_future_work.livemd` |
+| Analise de copias de memoria | Completo | `poc.livemd`, `exla_zero_copy.livemd` |
 | Benchmarks sistematicos | Completo | `benchmarks.livemd` |
+| Interop zero-copy via EXLA | Completo | `exla_zero_copy.livemd` |
+| Validacao LLDB (hardware-level) | Completo | `lldb_zero_copy_proof.exs`, `docs/research/lldb-zero-copy-proof.md` |
 
-O bridge de interoperabilidade funciona corretamente para todos os 16 tipos numericos do Nx suportados pelo NumPy (com ressalvas de precisao documentadas para floats de baixa precisao). O overhead e dominado pelo custo fixo de entrada no CPython para tensores pequenos e pela serializacao do Pythonx para tensores grandes. Uma abordagem zero-copy via NIF demonstra que o gargalo de serializacao pode ser eliminado em principio.
+O bridge de interoperabilidade funciona corretamente para todos os 16 tipos numericos do Nx suportados pelo NumPy, incluindo tipos sub-byte via ml_dtypes (com ressalvas de packing documentadas). O overhead e dominado pelo custo fixo de entrada no CPython para tensores pequenos e pela serializacao do Pythonx para tensores grandes. A abordagem zero-copy via EXLA `to_pointer`/`from_pointer` elimina completamente o gargalo de serializacao, com 0 copias de dados em ambas as direcoes.

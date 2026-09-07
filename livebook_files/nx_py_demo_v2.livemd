@@ -16,7 +16,9 @@ Mix.install([
   {:exla, github: "elixir-nx/nx", sparse: "exla", override: true, ref: "4c741d35"},
   {:pythonx, "~> 0.4.7"},
   {:kino, "~> 0.14"}
-])
+],
+  force: true
+)
 
 # Force EXLA as default backend — tensors land on CPU (:host client)
 Application.put_env(:nx, :default_backend, {EXLA.Backend, client: :host})
