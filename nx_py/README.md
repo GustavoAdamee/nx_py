@@ -156,6 +156,16 @@ Backends that implement Nx's pointer callbacks use the zero-copy path automatica
 
 This refactor removed the `NxPy.PythonLib` behaviour (NumPy is now the only, hardcoded target). If a different Python library becomes relevant, `NxPy.Dtype` is the single place to adjust (or fork into a separate module with its own `to_numpy/1`/`from_numpy/1` equivalents).
 
+## Acknowledgments
+
+Developed as an undergraduate capstone thesis (TCC) at UTFPR under the supervision of
+**Adolfo Neto** (advisor) and **Paulo Valente** ([@polvalente](https://github.com/polvalente),
+co-advisor), whose reviews shaped the encoder dispatch, the GC-safety contract on the zero-copy
+path, and the decision to pin dependencies to explicit git refs for reproducibility.
+
+Built on [Nx](https://github.com/elixir-nx/nx) and
+[Pythonx](https://github.com/livebook-dev/pythonx).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
