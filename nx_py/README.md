@@ -8,18 +8,15 @@ NxPy lets an Elixir application share tensor data with an embedded Python runtim
 
 ## Overview
 
-```
-Nx tensor (any supported backend)
-        │
-        ▼  (passed as a Pythonx.eval global)
-Pythonx.Encoder for Nx.Tensor  ──►  NxPy.Encoder.encode_pointer/1 (zero-copy)
-                                  ──║  NxPy.Encoder.encode_binary/1 (copy-based, Binary)
-                                    ║
-                                    ▼
-                          nx_py.NxTensor (Python object wrapping a numpy array)
-                                    │
-                                    ▼  (returned from Pythonx.eval)
-                       NxPy.from_python/2 ──►  Nx tensor
+```mermaid
+flowchart TD
+    A["Nx tensor"] -->|passed as a Pythonx.eval global| B["Pythonx.Encoder for Nx.Tensor"]
+    B -->|pointer-capable backend<br/>(e.g. EXLA.Backend)| C["NxPy.Encoder.encode_pointer/1<br/>(zero-copy)"]
+    B -->|Nx.BinaryBackend| D["NxPy.Encoder.encode_binary/1<br/>(copy-based)"]
+    C --> E["nx_py.NxTensor<br/>(Python object wrapping a numpy array)"]
+    D --> E
+    E -->|returned from Pythonx.eval| F["NxPy.from_python/2"]
+    F --> G["Nx tensor"]
 ```
 
 Backends are dispatched by inspecting `tensor.data`:
@@ -135,8 +132,9 @@ mix test test/nx_py_test.exs test/nx_py/dtype_test.exs test/nx_py/encoder_test.e
 # Full suite (integration test needs network for uv + numpy + ml-dtypes + bundled nx_py):
 mix test
 
-# Standalone integration script (also needs network):
-elixir nx_py/test_integration.exs
+# Standalone integration + memory-proof script (also needs network).
+# Run from the repository root:
+elixir livebook_files/nx_py_integration_proof.exs
 ```
 
 Test files mirror `lib/`:
@@ -158,6 +156,16 @@ Backends that implement Nx's pointer callbacks use the zero-copy path automatica
 
 This refactor removed the `NxPy.PythonLib` behaviour (NumPy is now the only, hardcoded target). If a different Python library becomes relevant, `NxPy.Dtype` is the single place to adjust (or fork into a separate module with its own `to_numpy/1`/`from_numpy/1` equivalents).
 
+## Acknowledgments
+
+Developed as an undergraduate capstone thesis (TCC) at UTFPR under the supervision of
+**Adolfo Neto** (advisor) and **Paulo Valente** ([@polvalente](https://github.com/polvalente),
+co-advisor), whose reviews shaped the encoder dispatch, the GC-safety contract on the zero-copy
+path, and the decision to pin dependencies to explicit git refs for reproducibility.
+
+Built on [Nx](https://github.com/elixir-nx/nx) and
+[Pythonx](https://github.com/livebook-dev/pythonx).
+
 ## License
 
-TODO
+MIT — see [LICENSE](LICENSE).

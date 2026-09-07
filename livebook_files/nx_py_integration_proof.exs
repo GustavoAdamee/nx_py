@@ -1,7 +1,10 @@
-# nx_py Integration Test Script (protocol/encoder-based)
+# nx_py Integration + Memory Proof Script (protocol/encoder-based)
 #
-# Run from the TCC root directory:
-#   cd /Users/gdomingues/Documents/UTFPR/TCC && elixir nx_py/test_integration.exs
+# Run from the repository root:
+#   elixir livebook_files/nx_py_integration_proof.exs
+#
+# Section 6 below produces the RSS figures reported in
+# preliminary_results_report.md, section 6.1.
 #
 # This script tests the full round-trip with Pythonx using the new
 # Pythonx.Encoder for Nx.Tensor dispatch + NxPy.from_python/2:
@@ -13,7 +16,7 @@
 # 6. Memory proofs (RSS)
 
 Mix.install([
-  {:nx_py, path: __DIR__},
+  {:nx_py, path: Path.join([__DIR__, "..", "nx_py"])},
   {:nx, github: "elixir-nx/nx", sparse: "nx", override: true, ref: "4c741d35"},
   {:exla, github: "elixir-nx/nx", sparse: "exla", override: true, ref: "4c741d35"},
   {:pythonx, "~> 0.4.7"}

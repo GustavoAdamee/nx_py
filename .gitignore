@@ -1,0 +1,23 @@
+# Local upstream checkout of elixir-nx/nx (its own git repo, built with DEBUG=1
+# for the LLDB zero-copy proof). Never committed here.
+nx/
+
+# Superseded NIF experiment, kept locally for reference.
+zero_copy_nif/
+
+# Agent/tooling scaffolding — local to each working copy.
+CLAUDE.md
+.rtk/
+
+# Everything under docs/ is local except the research notes. The advisor
+# feedback log stays local — it is working notes, not a result.
+docs/*
+!docs/research/
+docs/research/next-steps-advisor-feedback.md
+
+# Thesis prose drafts — kept locally, written from this code as reference.
+TCC 1 - Resultados preliminares.md
+preliminary_results_report.md
+
+# macOS
+.DS_Store
