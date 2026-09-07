@@ -161,4 +161,4 @@ This refactor removed the `NxPy.PythonLib` behaviour (NumPy is now the only, har
 
 ## License
 
-TODO
+MIT — see [LICENSE](LICENSE).
