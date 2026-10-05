@@ -10,12 +10,12 @@ NxPy lets an Elixir application share tensor data with an embedded Python runtim
 
 ```mermaid
 flowchart TD
-    A["Nx tensor"] -->|passed as a Pythonx.eval global| B["Pythonx.Encoder for Nx.Tensor"]
-    B -->|pointer-capable backend<br/>(e.g. EXLA.Backend)| C["NxPy.Encoder.encode_pointer/1<br/>(zero-copy)"]
-    B -->|Nx.BinaryBackend| D["NxPy.Encoder.encode_binary/1<br/>(copy-based)"]
+    A["Nx tensor"] -->|"passed as a Pythonx.eval global"| B["Pythonx.Encoder for Nx.Tensor"]
+    B -->|"pointer-capable backend<br/>(e.g. EXLA.Backend)"| C["NxPy.Encoder.encode_pointer/1<br/>(zero-copy)"]
+    B -->|"Nx.BinaryBackend"| D["NxPy.Encoder.encode_binary/1<br/>(copy-based)"]
     C --> E["nx_py.NxTensor<br/>(Python object wrapping a numpy array)"]
     D --> E
-    E -->|returned from Pythonx.eval| F["NxPy.from_python/2"]
+    E -->|"returned from Pythonx.eval"| F["NxPy.from_python/2"]
     F --> G["Nx tensor"]
 ```
 
