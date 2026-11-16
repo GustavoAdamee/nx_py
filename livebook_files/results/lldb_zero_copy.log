@@ -1,0 +1,42 @@
+# nx_py zero-copy proof with LLDB as external observer
+# lldb-1703.0.234.3; Elixir 1.18.4; OTP 28; EXLA 0.11.0; Pythonx 0.4.10; BEAM pid 1494
+
+## 1. Elixir: tensor EXLA s32 [1, 2, 3, 4, 5]
+Nx.to_pointer -> address 0xAC8F8C6C0, data_size 20
+$ lldb --batch -p 1494 -o "memory read --format d --size 4 --count 5 0xAC8F8C6C0"
+  (lldb) process attach --pid 1494
+  (lldb) memory read --format d --size 4 --count 5 0xAC8F8C6C0
+  0xac8f8c6c0: 1
+  0xac8f8c6c4: 2
+  0xac8f8c6c8: 3
+  0xac8f8c6cc: 4
+  0xac8f8c6d0: 5
+  (lldb) process detach
+
+## 2. Python: arr = obj.array; arr[0] = 99
+arr.ctypes.data = 0xAC8F8C6C0 (same as Elixir: true); OWNDATA = false; arr = [99, 2, 3, 4, 5]
+$ lldb --batch -p 1494 -o "memory read --format d --size 4 --count 5 0xAC8F8C6C0"
+  (lldb) process attach --pid 1494
+  (lldb) memory read --format d --size 4 --count 5 0xAC8F8C6C0
+  0xac8f8c6c0: 99
+  0xac8f8c6c4: 2
+  0xac8f8c6c8: 3
+  0xac8f8c6cc: 4
+  0xac8f8c6d0: 5
+  (lldb) process detach
+
+## 3. LLDB writes 77 at element [4] (0xAC8F8C6C0 + 16)
+$ lldb --batch -p 1494 -o "memory write --size 4 --format d 0xAC8F8C6C0+16 77" -o "memory read --format d --size 4 --count 5 0xAC8F8C6C0"
+  (lldb) process attach --pid 1494
+  (lldb) memory write --size 4 --format d 0xAC8F8C6C0+16 77
+  (lldb) memory read --format d --size 4 --count 5 0xAC8F8C6C0
+  0xac8f8c6c0: 99
+  0xac8f8c6c4: 2
+  0xac8f8c6c8: 3
+  0xac8f8c6cc: 4
+  0xac8f8c6d0: 77
+  (lldb) process detach
+Elixir (original tensor): [99, 2, 3, 4, 77]
+Python (obj.array):       [99, 2, 3, 4, 77]
+
+RESULT: PASS - one buffer, three observers
