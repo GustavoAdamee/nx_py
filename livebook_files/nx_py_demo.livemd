@@ -2,9 +2,9 @@
 
 ## Section
 
-Demonstrates the `nx_py` Mix library for plug-and-play interoperability between
-Nx tensors and Python. Uses `NxPy.to_python/1` and `NxPy.from_python/2` instead
-of inline bridge modules.
+Demonstrates the `nx_py` library: tensors passed directly as `Pythonx.eval`
+globals (via `Pythonx.Encoder` for `Nx.Tensor`) and reconstructed with
+`NxPy.from_python/2`.
 
 ## Setup
 
@@ -15,15 +15,15 @@ Mix.install([
   {:exla, github: "elixir-nx/nx", sparse: "exla", override: true, ref: "4c741d35"},
   {:pythonx, "~> 0.4.7"},
   {:kino, "~> 0.14"}
-])
+],
+  force: true
+)
 
 # Force EXLA as default backend — tensors land on CPU (:host client)
 Application.put_env(:nx, :default_backend, {EXLA.Backend, client: :host})
 
-# Initialize Python environment (numpy + ml-dtypes)
+# Initialize Python environment (numpy + ml-dtypes + bundled nx_py package)
 NxPy.init_python()
-
-NxPy.configure(backend: NxPy.Backend.EXLA, python_lib: NxPy.PythonLib.Numpy)
 ```
 
 ## Verify Pythonx Process Model
@@ -42,116 +42,102 @@ IO.puts("Same process: #{py_pid == beam_pid}")
 
 ## Binary Backend Demo (copy-based)
 
-Switch to the Binary backend for a copy-based round-trip. The `ref.data` field
-contains the binary — Python reads it via `np.frombuffer`.
+Build a `Nx.BinaryBackend` tensor, pass it straight into `Pythonx.eval` as a
+global; Python does `arr = tensor.array; arr * 10` and returns an `NxTensor`;
+reconstruct with `NxPy.from_python/2`.
 
 ```elixir
-NxPy.configure(backend: NxPy.Backend.Binary, python_lib: NxPy.PythonLib.Numpy)
-
 tensor = Nx.iota({5}, type: {:s, 32})
-ref = NxPy.to_python(tensor)
 
-IO.inspect(ref, label: "Python reference")
+{result, _} =
+  Pythonx.eval(
+    """
+    arr = tensor.array
+    out = arr * 10
+    from nx_py import NxTensor
+    NxTensor(out)
+    """,
+    %{"tensor" => tensor}
+  )
 
-{py_result, _} = Pythonx.eval(
-  """
-  import numpy as np
-  arr = np.frombuffer(data, dtype='#{ref.dtype}').reshape(#{inspect(ref.shape)})
-  result = arr * 10
-  result.tobytes()
-  """,
-  %{"data" => ref.data}
-)
-
-result_bytes = Pythonx.decode(py_result)
-ref = %{ref | data: result_bytes}
-result = NxPy.from_python(ref, type: {:s, 32}, shape: {5})
+result_tensor = NxPy.from_python(result, backend: Nx.BinaryBackend)
 
 IO.puts("Input:  #{inspect(Nx.to_flat_list(tensor))}")
-IO.puts("Output: #{inspect(Nx.to_flat_list(result))}")
+IO.puts("Output: #{inspect(Nx.to_flat_list(result_tensor))}")
 IO.puts("Expected: #{inspect(Nx.to_flat_list(Nx.multiply(tensor, 10)))}")
-IO.puts("Correct: #{Nx.to_flat_list(result) == Nx.to_flat_list(Nx.multiply(tensor, 10))}")
+IO.puts("Correct: #{Nx.to_flat_list(result_tensor) == Nx.to_flat_list(Nx.multiply(tensor, 10))}")
 ```
 
-## EXLA Backend Demo (zero-copy)
+## EXLA Backend Demo (zero-copy, in-place)
 
-Switch to the EXLA backend. The `ref.pointer` field contains the raw memory address
-— Python accesses it via `ctypes.from_address`. No data is copied at any boundary.
+EXLA tensor passed as a global; Python mutates `tensor.array` in place
+(`arr *= 10`, writing straight into the `DeviceBuffer`); reconstruct with
+`NxPy.from_python/2`. Referencing the original tensor after the reconstructed
+tensor's final use keeps its buffer alive throughout the operation.
 
 ```elixir
-NxPy.configure(backend: NxPy.Backend.EXLA, python_lib: NxPy.PythonLib.Numpy)
+input_tensor = Nx.iota({5}, type: {:s, 32}, backend: EXLA.Backend)
 
-# Create input tensor on EXLA :host
-input_tensor = Nx.iota({5}, type: {:s, 32})
-ref = NxPy.to_python(input_tensor)
+{result, _} =
+  Pythonx.eval(
+    """
+    arr = tensor.array       # zero-copy numpy view over the DeviceBuffer
+    arr *= 10                # in-place — writes straight into the DeviceBuffer
+    tensor
+    """,
+    %{"tensor" => input_tensor}
+  )
 
-IO.inspect(ref, label: "Python reference (zero-copy)")
-
-# Python reads from the pointer and writes back into the same memory
-{_, _} = Pythonx.eval(
-  """
-  import ctypes, numpy as np
-  buf = (ctypes.c_uint8 * #{ref.data_size}).from_address(#{ref.pointer})
-  arr = np.frombuffer(buf, dtype='#{ref.dtype}').reshape(#{inspect(ref.shape)})
-  # Compute in-place — writes directly to EXLA DeviceBuffer
-  np.copyto(arr, arr * 10)
-  """,
-  %{}
-)
-
-# For zero-copy, the tensor already has the updated data
-result = NxPy.from_python(ref, type: {:s, 32}, shape: {5})
+result_tensor = NxPy.from_python(result, backend: EXLA.Backend)
 
 IO.puts("Input:  #{inspect(Nx.to_flat_list(input_tensor))}")
-IO.puts("Output: #{inspect(Nx.to_flat_list(result))}")
+IO.puts("Output: #{inspect(Nx.to_flat_list(result_tensor))}")
 IO.puts("Expected: #{inspect(Nx.to_flat_list(Nx.multiply(Nx.iota({5}, type: {:s, 32}), 10)))}")
-IO.puts("Correct: #{Nx.to_flat_list(result) == Nx.to_flat_list(Nx.multiply(Nx.iota({5}, type: {:s, 32}), 10))}")
+IO.puts("Correct: #{Nx.to_flat_list(result_tensor) == Nx.to_flat_list(Nx.multiply(Nx.iota({5}, type: {:s, 32}), 10))}")
+
+# Keep the owner live through the final use of `result_tensor`.
+input_tensor
 ```
 
 ## EXLA Zero-Copy with Separate Output Tensor
 
-In the previous demo, Python wrote in-place over the input tensor. For cases
-where the input must be preserved, use a separate output tensor.
+Pass an input tensor and a pre-allocated output tensor as two globals; Python
+writes `out.array[:] = in.array * 10`; reconstruct the output via
+`from_python/2`. Demonstrates preserving the input.
 
 ```elixir
-# Input tensor
-input_tensor = Nx.iota({1_000_000}, type: {:f, 32})
-input_ref = NxPy.to_python(input_tensor)
+input_tensor = Nx.iota({1_000_000}, type: {:f, 32}) |> Nx.backend_transfer(EXLA.Backend)
+output_tensor = Nx.broadcast(Nx.tensor(0.0, type: {:f, 32}), {1_000_000}) |> Nx.backend_transfer(EXLA.Backend)
 
-# Output tensor (zeros)
-output_tensor = Nx.broadcast(Nx.tensor(0.0, type: {:f, 32}), {1_000_000})
-output_ref = NxPy.to_python(output_tensor)
+{result, _} =
+  Pythonx.eval(
+    """
+    in_arr = input.array
+    out_arr = output.array
+    out_arr[:] = in_arr * 10
+    output
+    """,
+    %{"input" => input_tensor, "output" => output_tensor}
+  )
 
-# Python reads input, writes output — zero copies
-{_, _} = Pythonx.eval(
-  """
-  import ctypes, numpy as np
+result_tensor = NxPy.from_python(result, backend: EXLA.Backend)
+expected = Nx.multiply(Nx.iota({1_000_000}, type: {:f, 32}), 10.0)
 
-  # Read from input (zero-copy)
-  in_buf = (ctypes.c_uint8 * #{input_ref.data_size}).from_address(#{input_ref.pointer})
-  in_arr = np.frombuffer(in_buf, dtype='#{input_ref.dtype}')
-
-  # Write to output (zero-copy)
-  out_buf = (ctypes.c_uint8 * #{output_ref.data_size}).from_address(#{output_ref.pointer})
-  out_arr = np.frombuffer(out_buf, dtype='#{output_ref.dtype}')
-
-  out_arr[:] = in_arr * 10
-  """,
-  %{}
-)
-
-result = NxPy.from_python(output_ref, type: {:f, 32}, shape: {1_000_000})
-expected = Nx.multiply(Nx.iota({1_000_000}, type: {:f, 32}), 10)
-
-IO.puts("First 10 result:   #{inspect(Nx.to_flat_list(result |> Nx.slice_along_axis(0, 10)))}")
+IO.puts("First 10 result:   #{inspect(Nx.to_flat_list(result_tensor |> Nx.slice_along_axis(0, 10)))}")
 IO.puts("First 10 expected: #{inspect(Nx.to_flat_list(expected |> Nx.slice_along_axis(0, 10)))}")
-IO.puts("Correct: #{Nx.to_flat_list(result) == Nx.to_flat_list(expected)}")
+IO.puts("Correct: #{Nx.to_flat_list(result_tensor) == Nx.to_flat_list(expected)}")
+IO.puts("Input preserved: #{Nx.to_flat_list(input_tensor |> Nx.slice_along_axis(0, 5)) == [0.0, 1.0, 2.0, 3.0, 4.0]}")
+
+# Keep the output owner live through the final use of `result_tensor`.
+output_tensor
 ```
 
 ## Type Coverage
 
-Verify that all Nx types supported by NumPy work with `nx_py`, using the library's
-`NxPy.PythonLib.Numpy` dtype mapper.
+Verify that all Nx types supported by NumPy work through the encoder, by
+passing each `EXLA.Backend` tensor and asserting the resulting `NxTensor`'s
+`.dtype`/`.shape` (via a small `Pythonx.eval` reading `obj.dtype`,
+`tuple(obj.shape)`).
 
 ```elixir
 types_to_test = [
@@ -162,37 +148,39 @@ types_to_test = [
   {:c, 64}, {:c, 128}
 ]
 
-NxPy.configure(backend: NxPy.Backend.EXLA, python_lib: NxPy.PythonLib.Numpy)
-
 results =
   Enum.map(types_to_test, fn type ->
-    ml_dtypes? = NxPy.PythonLib.Numpy.requires_ml_dtypes?(%{type: type})
+    expected_dtype = NxPy.Dtype.to_numpy(type)
+    ml_dtypes? = type in [{:bf, 16}, {:f, 8}, {:f8_e4m3fn, 8}, {:s, 4}, {:s, 2}, {:u, 4}, {:u, 2}]
     strategy = if ml_dtypes?, do: "ml_dtypes", else: "native"
-    dtype = NxPy.PythonLib.Numpy.nx_to_dtype(%{type: type})
 
     {status, detail} =
       try do
         tensor = Nx.iota({100}) |> Nx.as_type(type) |> Nx.backend_transfer(EXLA.Backend)
-        ref = NxPy.to_python(tensor)
 
-        ptr_ok = is_integer(ref.pointer) and ref.pointer > 0
-        dtype_ok = is_binary(ref.dtype) and ref.dtype == dtype
+        {result, _} =
+          Pythonx.eval(
+            "(obj.dtype, tuple(obj.shape))",
+            %{"obj" => tensor}
+          )
 
-        if ptr_ok and dtype_ok do
-          {"ok", "pointer=#{ref.pointer}, dtype=#{ref.dtype}"}
+        {dtype_str, shape} = Pythonx.decode(result)
+
+        if dtype_str == expected_dtype and shape == {100} do
+          {"ok", "dtype=#{dtype_str}"}
         else
-          {"fail", "pointer_ok=#{ptr_ok}, dtype_ok=#{dtype_ok}"}
+          {"fail", "dtype=#{dtype_str} (expected #{expected_dtype}), shape=#{inspect(shape)}"}
         end
       rescue
         e -> {"error", Exception.message(e) |> String.slice(0, 50)}
       end
 
-    "| `#{inspect(type)}` | #{dtype} | #{strategy} | #{status} |"
+    "| `#{inspect(type)}` | #{expected_dtype} | #{strategy} | #{status} |"
   end)
 
 table = """
-| Type | NumPy dtype | Strategy | to_python |
-|------|-------------|----------|-----------|
+| Type | NumPy dtype | Strategy | encoder |
+|------|-------------|----------|---------|
 #{Enum.join(results, "\n")}
 """
 
@@ -201,8 +189,8 @@ Kino.Markdown.new(table)
 
 ## Memory Proofs
 
-Three isolated proofs measuring memory at each step via RSS (Resident Set Size).
-Reuses the `Mem` helper pattern from `exla_zero_copy.livemd`.
+Two isolated proofs measuring memory at each step via RSS (Resident Set Size).
+Reuses the `Mem` helper pattern from the original demo.
 
 ```elixir
 defmodule Mem do
@@ -232,74 +220,66 @@ end
 ### Proof A: Copy-based (Binary Backend)
 
 ```elixir
-NxPy.configure(backend: NxPy.Backend.Binary, python_lib: NxPy.PythonLib.Numpy)
-
 s0 = Mem.snapshot()
 
 tensor = Nx.iota({1_000_000}, type: {:f, 32})
-ref = NxPy.to_python(tensor)
+
+{result, _} =
+  Pythonx.eval(
+    """
+    arr = tensor.array
+    out = arr * 10
+    from nx_py import NxTensor
+    NxTensor(out)
+    """,
+    %{"tensor" => tensor}
+  )
 s1 = Mem.snapshot()
 
-{py_result, _} = Pythonx.eval(
-  """
-  import numpy as np
-  arr = np.frombuffer(data, dtype='#{ref.dtype}').reshape(#{inspect(ref.shape)})
-  result = arr * 10
-  result.tobytes()
-  """,
-  %{"data" => ref.data}
-)
-s2 = Mem.snapshot()
-
-result_bytes = Pythonx.decode(py_result)
-ref = %{ref | data: result_bytes}
-result = NxPy.from_python(ref, type: {:f, 32}, shape: {1_000_000})
+result_tensor = NxPy.from_python(result, backend: Nx.BinaryBackend)
 
 IO.puts("Proof A: Binary Backend (copy-based)")
-Mem.print_delta("to_python", Mem.delta(s0, s1))
-Mem.print_delta("Pythonx eval", Mem.delta(s1, s2))
-IO.puts("  Correct: #{Nx.to_flat_list(result |> Nx.slice_along_axis(0, 5)) == [0.0, 10.0, 20.0, 30.0, 40.0]}")
+Mem.print_delta("Pythonx eval", Mem.delta(s0, s1))
+IO.puts("  Correct: #{Nx.to_flat_list(result_tensor |> Nx.slice_along_axis(0, 5)) == [0.0, 10.0, 20.0, 30.0, 40.0]}")
 ```
 
 ### Proof B: Zero-copy (EXLA Backend)
 
 ```elixir
-NxPy.configure(backend: NxPy.Backend.EXLA, python_lib: NxPy.PythonLib.Numpy)
-
-input_tensor = Nx.iota({1_000_000}, type: {:f, 32})
-output_tensor = Nx.broadcast(Nx.tensor(0.0, type: {:f, 32}), {1_000_000})
-
-input_ref = NxPy.to_python(input_tensor)
-output_ref = NxPy.to_python(output_tensor)
+input_tensor = Nx.iota({1_000_000}, type: {:f, 32}) |> Nx.backend_transfer(EXLA.Backend)
+output_tensor = Nx.broadcast(Nx.tensor(0.0, type: {:f, 32}), {1_000_000}) |> Nx.backend_transfer(EXLA.Backend)
 
 s0 = Mem.snapshot()
 
-{_, _} = Pythonx.eval(
-  """
-  import ctypes, numpy as np
-  in_buf = (ctypes.c_uint8 * #{input_ref.data_size}).from_address(#{input_ref.pointer})
-  in_arr = np.frombuffer(in_buf, dtype='#{input_ref.dtype}')
-  out_buf = (ctypes.c_uint8 * #{output_ref.data_size}).from_address(#{output_ref.pointer})
-  out_arr = np.frombuffer(out_buf, dtype='#{output_ref.dtype}')
-  out_arr[:] = in_arr * 10
-  """,
-  %{}
-)
+{result, _} =
+  Pythonx.eval(
+    """
+    import numpy as np
+    in_arr = input.array
+    out_arr = output.array
+    np.multiply(in_arr, 10, out=out_arr)
+    output
+    """,
+    %{"input" => input_tensor, "output" => output_tensor}
+  )
 
 s1 = Mem.snapshot()
-result = NxPy.from_python(output_ref, type: {:f, 32}, shape: {1_000_000})
+result_tensor = NxPy.from_python(result, backend: EXLA.Backend)
 
 IO.puts("Proof B: EXLA Backend (zero-copy)")
 Mem.print_delta("Pythonx eval", Mem.delta(s0, s1))
-IO.puts("  Correct: #{Nx.to_flat_list(result |> Nx.slice_along_axis(0, 5)) == [0.0, 10.0, 20.0, 30.0, 40.0]}")
+IO.puts("  Correct: #{Nx.to_flat_list(result_tensor |> Nx.slice_along_axis(0, 5)) == [0.0, 10.0, 20.0, 30.0, 40.0]}")
 IO.puts("")
 IO.puts("  Expected: RSS ~0 — no data copied at any boundary.")
 IO.puts("  Contrast with Proof A where Pythonx eval shows significant RSS growth.")
+
+# Retain the output buffer owner through the final read above.
+output_tensor
 ```
 
 ## Copy Count Summary
 
-| Backend               | Approach                      | Copies  | Mechanism                                                     |
-| --------------------- | ----------------------------- | :-----: | ------------------------------------------------------------- |
-| `NxPy.Backend.Binary` | `to_binary` + Pythonx         | **2-3** | Pythonx copies on input + `tobytes()` on output               |
-| `NxPy.Backend.EXLA`   | `to_pointer(:local)` + ctypes | **0**   | Python reads/writes same physical memory as EXLA DeviceBuffer |
+| Backend            | Approach                                     | Copies  | Mechanism                                                                              |
+| ------------------ | -------------------------------------------- | :-----: | -------------------------------------------------------------------------------------- |
+| `Nx.BinaryBackend` | encoder: `to_binary` + `frombuffer().copy()` | **2-3** | Pythonx copies binary on input + `.copy()` breaks alias + `tobytes()` on `from_python` |
+| `EXLA.Backend`     | encoder: `to_pointer(:local)` + numpy view   | **0**   | Python reads/writes same physical memory as EXLA DeviceBuffer via `tensor.array`       |

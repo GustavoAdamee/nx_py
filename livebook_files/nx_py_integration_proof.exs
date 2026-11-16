@@ -3,9 +3,6 @@
 # Run from the repository root:
 #   elixir livebook_files/nx_py_integration_proof.exs
 #
-# Section 6 below produces the RSS figures reported in
-# preliminary_results_report.md, section 6.1.
-#
 # This script tests the full round-trip with Pythonx using the new
 # Pythonx.Encoder for Nx.Tensor dispatch + NxPy.from_python/2:
 # 1. Binary backend (copy-based)
